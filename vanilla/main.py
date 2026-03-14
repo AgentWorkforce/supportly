@@ -1,182 +1,214 @@
 """
-Customer Service Escalation App — Pure Python (No Framework)
+Customer Service Escalation — Pure Python (asyncio + Relay SDK)
 
-Two agents communicate via Relay:
-  - front-desk: handles simple queries, escalates complex ones via DM
-  - specialist: responds to escalated issues via DM
+Two agents collaborate: Front Desk handles simple queries directly,
+escalates complex issues to a Specialist via Relay DM.
 """
 
 import asyncio
 import os
-import sys
-import time
-
-sys.path.insert(0, "/tmp/relay-565/packages/sdk-py/src")
+import random
+import string
+from datetime import datetime
 
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 config = RelayConfig(
-    workspace=os.environ.get("RELAY_WORKSPACE", "customer-service-vanilla"),
+    workspace=os.environ.get("RELAY_WORKSPACE", "demo"),
     api_key=os.environ.get("RELAY_API_KEY", "demo-key"),
     base_url=os.environ.get("RELAY_BASE_URL", "https://api.relaycast.dev"),
 )
 
-SIMPLE_RESPONSES = {
-    "hours": "We are open Monday-Friday, 9 AM to 6 PM EST.",
-    "return": "You can return items within 30 days with a receipt. Visit our Returns page.",
-    "shipping": "Standard shipping takes 5-7 business days. Express is 1-2 days.",
-    "contact": "You can reach us at support@example.com or call 1-800-555-0199.",
-}
+CHANNEL = "general"
 
-COMPLEX_KEYWORDS = ["billing dispute", "account compromised", "legal", "data breach", "refund denied"]
+SIMPLE_TOPICS = {"hours", "shipping", "returns", "tracking", "faq"}
+COMPLEX_TOPICS = {"billing_dispute", "security_incident", "legal", "fraud"}
 
 
-def classify_query(query: str) -> tuple[bool, str | None]:
-    """Return (is_simple, response_or_None)."""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def case_id() -> str:
+    tag = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"CASE-{tag}"
+
+
+def classify(query: str) -> str:
     lower = query.lower()
-    for keyword, response in SIMPLE_RESPONSES.items():
-        if keyword in lower:
-            return True, response
-    for keyword in COMPLEX_KEYWORDS:
-        if keyword in lower:
-            return False, None
-    return True, f"Thank you for your question. A general answer: please check our FAQ at help.example.com."
+    for topic in COMPLEX_TOPICS:
+        if topic.replace("_", " ") in lower:
+            return "complex"
+    return "simple"
 
 
-class FrontDeskAgent:
-    def __init__(self, relay: Relay):
-        self.relay = relay
-        self.pending_escalations: dict[str, str] = {}
-
-    async def handle_customer(self, customer_name: str, query: str) -> str:
-        print(f"\n{'='*60}")
-        print(f"[Front Desk] Customer '{customer_name}' asks: {query}")
-
-        is_simple, response = classify_query(query)
-
-        if is_simple:
-            print(f"[Front Desk] Simple query — responding directly.")
-            await self.relay.post("general", f"[{customer_name}] Q: {query} | A: {response}")
-            return response
-
-        print(f"[Front Desk] Complex query detected — escalating to specialist.")
-        escalation_msg = (
-            f"ESCALATION from {customer_name}: {query}\n"
-            f"Please investigate and provide a detailed response."
-        )
-        await self.relay.send("specialist", escalation_msg)
-        await self.relay.post(
-            "general",
-            f"[{customer_name}] Query escalated to specialist: {query[:80]}..."
-        )
-        self.pending_escalations[customer_name] = query
-        return "ESCALATED"
-
-    async def check_specialist_responses(self) -> list[tuple[str, str]]:
-        messages = await self.relay.inbox()
-        responses = []
-        for msg in messages:
-            if msg.sender == "specialist":
-                print(f"[Front Desk] Received specialist response: {msg.text[:100]}...")
-                responses.append((msg.sender, msg.text))
-        return responses
+def simple_response(query: str) -> str:
+    lower = query.lower()
+    if "hours" in lower or "open" in lower:
+        return "Our business hours are Mon-Fri 9 AM to 6 PM EST."
+    if "shipping" in lower:
+        return "Standard shipping takes 3-5 business days. Express is 1-2 days."
+    if "return" in lower:
+        return "You can return items within 30 days with a receipt."
+    return "Please visit our FAQ at help.example.com for more details."
 
 
-class SpecialistAgent:
-    def __init__(self, relay: Relay):
-        self.relay = relay
+# ---------------------------------------------------------------------------
+# Customer interactions
+# ---------------------------------------------------------------------------
 
-    def generate_response(self, escalation_text: str) -> str:
-        lower = escalation_text.lower()
-        if "billing dispute" in lower:
-            return (
-                "SPECIALIST RESPONSE: I've reviewed the billing dispute. "
-                "The charge appears to be from a subscription renewal. "
-                "I've initiated a refund of $49.99 and added a 20% discount code "
-                "for their next purchase: LOYAL20. Case #BD-2024-0847."
-            )
-        elif "account compromised" in lower:
-            return (
-                "SPECIALIST RESPONSE: Security incident flagged. "
-                "I've locked the account, forced a password reset, "
-                "revoked all active sessions, and enabled 2FA. "
-                "The customer should check their email for recovery steps. "
-                "Case #SEC-2024-0312."
-            )
-        elif "refund denied" in lower:
-            return (
-                "SPECIALIST RESPONSE: Reviewed the refund denial. "
-                "The item was outside the return window but given the customer's "
-                "loyalty (5+ years), I'm approving a store credit of full value. "
-                "Case #RF-2024-0156."
-            )
+CUSTOMERS = [
+    {"name": "Alice", "query": "What are your business hours?"},
+    {"name": "Bob", "query": "I have a billing dispute — I was charged twice for order #1042."},
+    {"name": "Carol", "query": "Security incident: my account appears compromised, unauthorized purchases."},
+]
+
+
+# ---------------------------------------------------------------------------
+# Front Desk Agent
+# ---------------------------------------------------------------------------
+
+async def front_desk(relay: Relay) -> list[str]:
+    """Triage customer queries. Returns list of escalated case descriptions."""
+    escalated = []
+    for customer in CUSTOMERS:
+        name, query = customer["name"], customer["query"]
+        category = classify(query)
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] Front Desk — {name}: {query}")
+
+        if category == "simple":
+            answer = simple_response(query)
+            await relay.post(CHANNEL, f"[Front Desk] {name} asked: {query}\nAnswer: {answer}")
+            print(f"[{ts}] Front Desk — answered {name} directly.")
         else:
-            return (
-                "SPECIALIST RESPONSE: I've investigated this issue thoroughly. "
-                "It requires further review by the legal team. "
-                "I've filed an internal ticket and the customer will be "
-                "contacted within 24 hours. Case #GEN-2024-0999."
+            cid = case_id()
+            escalation_msg = (
+                f"ESCALATION {cid}\n"
+                f"Customer: {name}\n"
+                f"Issue: {query}\n"
+                f"Priority: HIGH"
             )
+            await relay.send("specialist", escalation_msg)
+            await relay.post(
+                CHANNEL,
+                f"[Front Desk] {name}'s issue ({cid}) escalated to specialist.",
+            )
+            escalated.append(cid)
+            print(f"[{ts}] Front Desk — escalated {name} → specialist ({cid}).")
 
-    async def process_inbox(self) -> int:
-        messages = await self.relay.inbox()
-        processed = 0
-        for msg in messages:
-            if msg.sender == "front-desk" and "ESCALATION" in msg.text:
-                print(f"\n[Specialist] Received escalation: {msg.text[:80]}...")
-                response = self.generate_response(msg.text)
-                print(f"[Specialist] Sending response: {response[:80]}...")
-                await self.relay.send("front-desk", response)
-                await self.relay.post("general", f"[Specialist] Resolved escalation: {response[:100]}...")
-                processed += 1
-        return processed
+    return escalated
 
 
-async def run_demo():
+# ---------------------------------------------------------------------------
+# Specialist Agent
+# ---------------------------------------------------------------------------
+
+async def specialist_process(relay: Relay) -> None:
+    """Check inbox for escalations and resolve them."""
+    await asyncio.sleep(0.5)  # allow messages to arrive
+    messages = await relay.inbox()
+
+    for msg in messages:
+        if "ESCALATION" not in msg.text:
+            continue
+
+        lines = msg.text.strip().splitlines()
+        cid = lines[0].split()[-1] if lines else "UNKNOWN"
+        customer_line = next((l for l in lines if l.startswith("Customer:")), "")
+        issue_line = next((l for l in lines if l.startswith("Issue:")), "")
+        customer_name = customer_line.replace("Customer:", "").strip()
+        issue = issue_line.replace("Issue:", "").strip()
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] Specialist — processing {cid} for {customer_name}")
+
+        resolution = generate_resolution(cid, customer_name, issue)
+
+        await relay.send("front-desk", f"RESOLUTION {cid}\n{resolution}")
+        await relay.post(CHANNEL, f"[Specialist] Resolved {cid} for {customer_name}.")
+        print(f"[{ts}] Specialist — resolved {cid}.")
+
+
+def generate_resolution(cid: str, customer: str, issue: str) -> str:
+    lower = issue.lower()
+    if "billing" in lower or "charged" in lower:
+        return (
+            f"Case {cid}: Reviewed billing records for {customer}. "
+            "Duplicate charge confirmed. Refund of $49.99 initiated — "
+            "expect 3-5 business days. Apologies for the inconvenience."
+        )
+    if "security" in lower or "compromised" in lower:
+        return (
+            f"Case {cid}: Account for {customer} has been locked. "
+            "Unauthorized transactions reversed. Temporary credentials "
+            "sent to verified email. Please reset password within 24h."
+        )
+    return f"Case {cid}: Issue for {customer} reviewed and resolved."
+
+
+# ---------------------------------------------------------------------------
+# Follow-up — Front Desk reads specialist responses
+# ---------------------------------------------------------------------------
+
+async def follow_up(relay: Relay) -> None:
+    """Front desk checks inbox for specialist resolutions."""
+    await asyncio.sleep(0.5)
+    messages = await relay.inbox()
+
+    for msg in messages:
+        if "RESOLUTION" not in msg.text:
+            continue
+        lines = msg.text.strip().splitlines()
+        cid = lines[0].split()[-1] if lines else "UNKNOWN"
+        detail = "\n".join(lines[1:]).strip()
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] Front Desk — received resolution for {cid}")
+        await relay.post(CHANNEL, f"[Front Desk] Resolution received:\n{detail}")
+
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+
+async def main() -> None:
     print("=" * 60)
-    print("Customer Service Escalation App — Vanilla Python")
+    print("Customer Service Escalation — Vanilla Python")
     print("=" * 60)
 
-    front_relay = Relay("front-desk", config)
-    specialist_relay = Relay("specialist", config)
+    front = Relay("front-desk", config)
+    spec = Relay("specialist", config)
 
-    async with front_relay, specialist_relay:
-        front_desk = FrontDeskAgent(front_relay)
-        specialist = SpecialistAgent(specialist_relay)
+    await front.connect()
+    await spec.connect()
+    print("Agents connected.\n")
 
-        customer_queries = [
-            ("Alice", "What are your business hours?"),
-            ("Bob", "I have a billing dispute — I was charged twice for order #12345"),
-            ("Carol", "My account was compromised and someone made unauthorized purchases"),
-        ]
+    # Phase 1 — triage
+    print("--- Phase 1: Triage ---")
+    escalated = await front_desk(front)
+    print(f"\nEscalated cases: {escalated}\n")
 
-        print("\n--- Processing Customer Queries ---")
-        for customer_name, query in customer_queries:
-            result = await front_desk.handle_customer(customer_name, query)
-            if result != "ESCALATED":
-                print(f"[Front Desk] Direct response to {customer_name}: {result}")
+    # Phase 2 — specialist handles escalations
+    print("--- Phase 2: Specialist Processing ---")
+    await specialist_process(spec)
+    print()
 
-        await asyncio.sleep(1)
+    # Phase 3 — front desk reads resolutions
+    print("--- Phase 3: Follow-up ---")
+    await follow_up(front)
+    print()
 
-        print("\n--- Specialist Processing Escalations ---")
-        processed = await specialist.process_inbox()
-        print(f"[Specialist] Processed {processed} escalation(s)")
-
-        await asyncio.sleep(1)
-
-        print("\n--- Front Desk Checking Specialist Responses ---")
-        responses = await front_desk.check_specialist_responses()
-        for sender, text in responses:
-            print(f"[Front Desk] Got from {sender}: {text}")
-
-        print("\n--- Final Summary ---")
-        print(f"Total queries: {len(customer_queries)}")
-        print(f"Direct answers: {len(customer_queries) - processed}")
-        print(f"Escalated & resolved: {processed}")
-        print("=" * 60)
-        print("Demo complete!")
+    # Cleanup
+    await front.close()
+    await spec.close()
+    print("=" * 60)
+    print("Done.")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_demo())
+    asyncio.run(main())

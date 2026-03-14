@@ -1,290 +1,269 @@
 """
-Customer Service Escalation App — LangGraph
+Customer Service Escalation — LangGraph + Relay SDK
 
-Two LangGraph agent nodes communicate via Relay:
-  - front_desk_node: triages queries, DMs specialist for complex ones
-  - specialist_node: processes escalations, responds via DM
-
-Uses a StateGraph with conditional routing based on query complexity.
+A StateGraph routes customer queries through triage → specialist → follow-up
+nodes, using Relay DMs for inter-agent communication.
 """
 
 import asyncio
 import os
-import sys
-from typing import Annotated, TypedDict
+import random
+import string
+from datetime import datetime
+from typing import TypedDict
 
-sys.path.insert(0, "/tmp/relay-565/packages/sdk-py/src")
+from langgraph.graph import StateGraph, END
 
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
 
-from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
-from langchain_openai import ChatOpenAI
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 config = RelayConfig(
-    workspace=os.environ.get("RELAY_WORKSPACE", "customer-service-langgraph"),
+    workspace=os.environ.get("RELAY_WORKSPACE", "demo"),
     api_key=os.environ.get("RELAY_API_KEY", "demo-key"),
     base_url=os.environ.get("RELAY_BASE_URL", "https://api.relaycast.dev"),
 )
 
+CHANNEL = "general"
+COMPLEX_KEYWORDS = ["billing dispute", "security incident", "legal", "fraud"]
+
 front_relay = Relay("front-desk", config)
-specialist_relay = Relay("specialist", config)
-
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-SIMPLE_KEYWORDS = ["hours", "shipping", "return", "contact", "track", "password reset"]
-COMPLEX_KEYWORDS = ["billing dispute", "account compromised", "legal", "data breach",
-                     "refund denied", "unauthorized", "fraud"]
-
-SIMPLE_RESPONSES = {
-    "hours": "We are open Monday-Friday, 9 AM to 6 PM EST.",
-    "shipping": "Standard shipping takes 5-7 business days. Express is 1-2 days.",
-    "return": "You can return items within 30 days with a receipt.",
-    "contact": "Email support@example.com or call 1-800-555-0199.",
-    "track": "Use your tracking number at track.example.com.",
-    "password reset": "Visit account.example.com/reset to reset your password.",
-}
+spec_relay = Relay("specialist", config)
 
 
-# --- State Definition ---
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
-class CustomerState(TypedDict):
-    customer_name: str
+class CustomerQuery(TypedDict):
+    name: str
     query: str
-    classification: str  # "simple" or "complex"
-    response: str
-    escalation_sent: bool
-    specialist_response: str
-    messages: list[BaseMessage]
+    category: str
+    case_id: str
+    resolution: str
 
 
-# --- Graph Nodes ---
-
-async def classify_node(state: CustomerState) -> CustomerState:
-    """Classify the customer query as simple or complex."""
-    query_lower = state["query"].lower()
-
-    for keyword in COMPLEX_KEYWORDS:
-        if keyword in query_lower:
-            state["classification"] = "complex"
-            state["messages"].append(
-                AIMessage(content=f"Classified as COMPLEX: matched '{keyword}'")
-            )
-            return state
-
-    state["classification"] = "simple"
-    state["messages"].append(AIMessage(content="Classified as SIMPLE query."))
-    return state
+class ServiceState(TypedDict):
+    customers: list[CustomerQuery]
+    escalated_ids: list[str]
+    resolutions: list[str]
+    phase: str
 
 
-async def front_desk_simple_node(state: CustomerState) -> CustomerState:
-    """Handle simple queries directly."""
-    query_lower = state["query"].lower()
-    response = None
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    for keyword, resp in SIMPLE_RESPONSES.items():
-        if keyword in query_lower:
-            response = resp
-            break
-
-    if not response:
-        prompt = f"Customer '{state['customer_name']}' asks: '{state['query']}'. Provide a brief helpful answer."
-        result = await llm.ainvoke([HumanMessage(content=prompt)])
-        response = result.content
-
-    state["response"] = response
-    state["escalation_sent"] = False
-
-    print(f"[Front Desk] Direct answer for {state['customer_name']}: {response}")
-
-    await front_relay.post(
-        "general",
-        f"[{state['customer_name']}] Q: {state['query']} | A: {response}"
-    )
-
-    state["messages"].append(AIMessage(content=f"Direct response: {response}"))
-    return state
+def make_case_id() -> str:
+    tag = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"CASE-{tag}"
 
 
-async def front_desk_escalate_node(state: CustomerState) -> CustomerState:
-    """Escalate complex queries to specialist via DM."""
-    escalation_msg = (
-        f"ESCALATION from {state['customer_name']}: {state['query']}\n"
-        f"Please investigate and provide a detailed response."
-    )
-
-    print(f"[Front Desk] Escalating {state['customer_name']}'s query to specialist.")
-
-    await front_relay.send("specialist", escalation_msg)
-    await front_relay.post(
-        "general",
-        f"[{state['customer_name']}] Query escalated to specialist: {state['query'][:80]}..."
-    )
-
-    state["escalation_sent"] = True
-    state["response"] = "Your issue has been escalated to a specialist. You'll hear back shortly."
-    state["messages"].append(AIMessage(content="Escalated to specialist via Relay DM."))
-    return state
-
-
-async def specialist_node(state: CustomerState) -> CustomerState:
-    """Specialist processes the escalation and responds."""
-    messages = await specialist_relay.inbox()
-    escalation_messages = [m for m in messages if m.sender == "front-desk" and "ESCALATION" in m.text]
-
-    if not escalation_messages:
-        state["specialist_response"] = "No escalations found."
-        return state
-
-    for msg in escalation_messages:
-        print(f"[Specialist] Processing escalation: {msg.text[:80]}...")
-
-        prompt = (
-            f"You are a senior customer service specialist. "
-            f"Investigate this escalation and provide a detailed resolution with a case number:\n\n"
-            f"{msg.text}"
-        )
-        result = await llm.ainvoke([HumanMessage(content=prompt)])
-        resolution = result.content
-
-        await specialist_relay.send("front-desk", f"SPECIALIST RESPONSE: {resolution}")
-        await specialist_relay.post("general", f"[Specialist] Resolved: {resolution[:100]}...")
-
-        state["specialist_response"] = resolution
-        state["messages"].append(AIMessage(content=f"Specialist resolution: {resolution}"))
-        print(f"[Specialist] Sent resolution: {resolution[:80]}...")
-
-    return state
-
-
-async def followup_node(state: CustomerState) -> CustomerState:
-    """Front desk checks for specialist responses."""
-    responses = await front_relay.inbox()
-    specialist_msgs = [m for m in responses if m.sender == "specialist"]
-
-    if specialist_msgs:
-        for msg in specialist_msgs:
-            print(f"[Front Desk] Got specialist response: {msg.text[:80]}...")
-            await front_relay.post(
-                "general",
-                f"[{state['customer_name']}] Issue resolved: {msg.text[:100]}..."
-            )
-        state["messages"].append(AIMessage(content="Specialist response received and forwarded."))
-    else:
-        state["messages"].append(AIMessage(content="No specialist response yet."))
-
-    return state
-
-
-# --- Routing ---
-
-def route_by_classification(state: CustomerState) -> str:
-    if state["classification"] == "complex":
-        return "escalate"
+def classify(query: str) -> str:
+    lower = query.lower()
+    for kw in COMPLEX_KEYWORDS:
+        if kw in lower:
+            return "complex"
     return "simple"
 
 
-# --- Build the Graph ---
-
-def build_triage_graph() -> StateGraph:
-    graph = StateGraph(CustomerState)
-
-    graph.add_node("classify", classify_node)
-    graph.add_node("simple", front_desk_simple_node)
-    graph.add_node("escalate", front_desk_escalate_node)
-
-    graph.set_entry_point("classify")
-    graph.add_conditional_edges("classify", route_by_classification, {
-        "simple": "simple",
-        "escalate": "escalate",
-    })
-    graph.add_edge("simple", END)
-    graph.add_edge("escalate", END)
-
-    return graph.compile()
+def simple_answer(query: str) -> str:
+    lower = query.lower()
+    if "hours" in lower or "open" in lower:
+        return "Our business hours are Mon-Fri 9 AM to 6 PM EST."
+    if "shipping" in lower:
+        return "Standard shipping takes 3-5 business days. Express is 1-2 days."
+    if "return" in lower:
+        return "You can return items within 30 days with a receipt."
+    return "Please visit our FAQ at help.example.com for more details."
 
 
-def build_specialist_graph() -> StateGraph:
-    graph = StateGraph(CustomerState)
+def generate_resolution(cid: str, customer: str, issue: str) -> str:
+    lower = issue.lower()
+    if "billing" in lower or "charged" in lower:
+        return (
+            f"Case {cid}: Reviewed billing for {customer}. "
+            "Duplicate charge confirmed. Refund of $49.99 initiated — "
+            "expect 3-5 business days."
+        )
+    if "security" in lower or "compromised" in lower:
+        return (
+            f"Case {cid}: Account for {customer} locked. "
+            "Unauthorized transactions reversed. Temporary credentials "
+            "sent to verified email. Reset password within 24h."
+        )
+    return f"Case {cid}: Issue for {customer} reviewed and resolved."
 
-    graph.add_node("process", specialist_node)
 
-    graph.set_entry_point("process")
-    graph.add_edge("process", END)
+# ---------------------------------------------------------------------------
+# Graph Nodes
+# ---------------------------------------------------------------------------
 
-    return graph.compile()
+async def triage_node(state: ServiceState) -> ServiceState:
+    """Classify and handle each customer query."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    escalated_ids = []
+    updated_customers = []
+
+    for cust in state["customers"]:
+        name, query = cust["name"], cust["query"]
+        category = classify(query)
+        cid = ""
+
+        if category == "simple":
+            answer = simple_answer(query)
+            await front_relay.post(
+                CHANNEL, f"[Front Desk] {name} asked: {query}\nAnswer: {answer}"
+            )
+            print(f"[{ts}] Triage — answered {name} directly.")
+        else:
+            cid = make_case_id()
+            escalation = (
+                f"ESCALATION {cid}\nCustomer: {name}\n"
+                f"Issue: {query}\nPriority: HIGH"
+            )
+            await front_relay.send("specialist", escalation)
+            await front_relay.post(
+                CHANNEL, f"[Front Desk] {name}'s issue ({cid}) escalated."
+            )
+            escalated_ids.append(cid)
+            print(f"[{ts}] Triage — escalated {name} → specialist ({cid}).")
+
+        updated_customers.append({
+            **cust,
+            "category": category,
+            "case_id": cid,
+        })
+
+    return {
+        **state,
+        "customers": updated_customers,
+        "escalated_ids": escalated_ids,
+        "phase": "specialist",
+    }
 
 
-def build_followup_graph() -> StateGraph:
-    graph = StateGraph(CustomerState)
+async def specialist_node(state: ServiceState) -> ServiceState:
+    """Process escalated issues from Relay inbox."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    await asyncio.sleep(0.5)
+    messages = await spec_relay.inbox()
+    resolutions = []
 
+    for msg in messages:
+        if "ESCALATION" not in msg.text:
+            continue
+        lines = msg.text.strip().splitlines()
+        cid = lines[0].split()[-1] if lines else "UNKNOWN"
+        customer_line = next((l for l in lines if l.startswith("Customer:")), "")
+        issue_line = next((l for l in lines if l.startswith("Issue:")), "")
+        customer = customer_line.replace("Customer:", "").strip()
+        issue = issue_line.replace("Issue:", "").strip()
+
+        resolution = generate_resolution(cid, customer, issue)
+        await spec_relay.send("front-desk", f"RESOLUTION {cid}\n{resolution}")
+        await spec_relay.post(CHANNEL, f"[Specialist] Resolved {cid} for {customer}.")
+        resolutions.append(resolution)
+        print(f"[{ts}] Specialist — resolved {cid} for {customer}.")
+
+    return {**state, "resolutions": resolutions, "phase": "followup"}
+
+
+async def followup_node(state: ServiceState) -> ServiceState:
+    """Front desk reads resolutions and posts follow-ups."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    await asyncio.sleep(0.5)
+    messages = await front_relay.inbox()
+
+    for msg in messages:
+        if "RESOLUTION" not in msg.text:
+            continue
+        lines = msg.text.strip().splitlines()
+        cid = lines[0].split()[-1] if lines else "UNKNOWN"
+        detail = "\n".join(lines[1:]).strip()
+        await front_relay.post(CHANNEL, f"[Front Desk] Resolution received:\n{detail}")
+        print(f"[{ts}] Follow-up — posted resolution for {cid}.")
+
+    return {**state, "phase": "done"}
+
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+def route_after_triage(state: ServiceState) -> str:
+    if state.get("escalated_ids"):
+        return "specialist"
+    return "followup"
+
+
+def route_after_specialist(state: ServiceState) -> str:
+    return "followup"
+
+
+# ---------------------------------------------------------------------------
+# Build graph
+# ---------------------------------------------------------------------------
+
+def build_graph() -> StateGraph:
+    graph = StateGraph(ServiceState)
+
+    graph.add_node("triage", triage_node)
+    graph.add_node("specialist", specialist_node)
     graph.add_node("followup", followup_node)
 
-    graph.set_entry_point("followup")
+    graph.set_entry_point("triage")
+    graph.add_conditional_edges("triage", route_after_triage)
+    graph.add_edge("specialist", "followup")
     graph.add_edge("followup", END)
 
     return graph.compile()
 
 
-async def run_demo():
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+CUSTOMERS = [
+    {"name": "Alice", "query": "What are your business hours?",
+     "category": "", "case_id": "", "resolution": ""},
+    {"name": "Bob", "query": "I have a billing dispute — I was charged twice for order #1042.",
+     "category": "", "case_id": "", "resolution": ""},
+    {"name": "Carol", "query": "Security incident: my account appears compromised, unauthorized purchases.",
+     "category": "", "case_id": "", "resolution": ""},
+]
+
+
+async def main() -> None:
     print("=" * 60)
-    print("Customer Service Escalation App — LangGraph")
+    print("Customer Service Escalation — LangGraph")
     print("=" * 60)
 
-    async with front_relay, specialist_relay:
+    await front_relay.connect()
+    await spec_relay.connect()
+    print("Agents connected.\n")
 
-        customer_queries = [
-            ("Alice", "What are your business hours?"),
-            ("Bob", "I have a billing dispute — I was charged twice for order #12345"),
-            ("Carol", "My account was compromised and someone made unauthorized purchases"),
-        ]
+    app = build_graph()
 
-        triage_graph = build_triage_graph()
-        specialist_graph = build_specialist_graph()
-        followup_graph = build_followup_graph()
+    initial_state: ServiceState = {
+        "customers": CUSTOMERS,
+        "escalated_ids": [],
+        "resolutions": [],
+        "phase": "triage",
+    }
 
-        # Phase 1: Triage all queries
-        print("\n--- Phase 1: Front Desk Triage ---")
-        escalated_states = []
+    final_state = await app.ainvoke(initial_state)
+    print(f"\nFinal phase: {final_state['phase']}")
+    print(f"Resolutions: {len(final_state['resolutions'])}")
 
-        for customer_name, query in customer_queries:
-            print(f"\n[Triaging] {customer_name}: {query}")
-            initial_state: CustomerState = {
-                "customer_name": customer_name,
-                "query": query,
-                "classification": "",
-                "response": "",
-                "escalation_sent": False,
-                "specialist_response": "",
-                "messages": [HumanMessage(content=query)],
-            }
-            result = await triage_graph.ainvoke(initial_state)
-            print(f"[Result] Classification: {result['classification']}, Response: {result['response'][:80]}...")
-            if result["escalation_sent"]:
-                escalated_states.append(result)
-
-        await asyncio.sleep(2)
-
-        # Phase 2: Specialist processes
-        print("\n--- Phase 2: Specialist Processing ---")
-        for state in escalated_states:
-            result = await specialist_graph.ainvoke(state)
-            print(f"[Specialist] {result.get('specialist_response', 'No response')[:80]}...")
-
-        await asyncio.sleep(2)
-
-        # Phase 3: Follow-up
-        print("\n--- Phase 3: Front Desk Follow-up ---")
-        for state in escalated_states:
-            result = await followup_graph.ainvoke(state)
-
-        print("\n--- Summary ---")
-        print(f"Total queries: {len(customer_queries)}")
-        print(f"Escalated: {len(escalated_states)}")
-        print("=" * 60)
-        print("Demo complete!")
+    await front_relay.close()
+    await spec_relay.close()
+    print("=" * 60)
+    print("Done.")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_demo())
+    asyncio.run(main())

@@ -1,216 +1,250 @@
 """
-Customer Service Escalation App — CrewAI Framework
+Customer Service Escalation — CrewAI + Relay SDK
 
-Two CrewAI agents communicate via Relay:
-  - front-desk: triages queries, uses relay_send tool to DM specialist
-  - specialist: processes escalations, responds via relay_send
+Two CrewAI agents (Front Desk, Specialist) collaborate via Relay DMs
+to triage and resolve customer issues.
 """
 
 import asyncio
 import os
-import sys
+import random
+import string
+from datetime import datetime
 
-sys.path.insert(0, "/tmp/relay-565/packages/sdk-py/src")
+from crewai import Agent, Crew, Task, Process
+from crewai.tools import tool
 
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
 
-from crewai import Agent, Task, Crew, Process
-from crewai.tools import tool
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 config = RelayConfig(
-    workspace=os.environ.get("RELAY_WORKSPACE", "customer-service-crewai"),
+    workspace=os.environ.get("RELAY_WORKSPACE", "demo"),
     api_key=os.environ.get("RELAY_API_KEY", "demo-key"),
     base_url=os.environ.get("RELAY_BASE_URL", "https://api.relaycast.dev"),
 )
 
+CHANNEL = "general"
+
+SIMPLE_TOPICS = {"hours", "shipping", "returns", "tracking", "faq"}
+COMPLEX_TOPICS = {"billing_dispute", "security_incident", "legal", "fraud"}
+
 front_relay = Relay("front-desk", config)
-specialist_relay = Relay("specialist", config)
+spec_relay = Relay("specialist", config)
 
 
-# --- Relay Tools for Front Desk ---
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-@tool
-def front_send_to_specialist(message: str) -> str:
-    """Send a DM to the specialist agent for complex issue escalation."""
-    front_relay.send_sync("specialist", message)
-    return "Escalation sent to specialist."
-
-@tool
-def front_post_to_channel(message: str) -> str:
-    """Post a status update to the general channel."""
-    front_relay.post_sync("general", message)
-    return "Posted to general channel."
-
-@tool
-def front_check_inbox() -> str:
-    """Check inbox for replies from the specialist."""
-    messages = front_relay.inbox_sync()
-    if not messages:
-        return "No new messages."
-    return "\n".join(f"From {m.sender}: {m.text}" for m in messages)
+def case_id() -> str:
+    tag = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"CASE-{tag}"
 
 
-# --- Relay Tools for Specialist ---
-
-@tool
-def specialist_send_to_front(message: str) -> str:
-    """Send a DM response back to the front-desk agent."""
-    specialist_relay.send_sync("front-desk", message)
-    return "Response sent to front-desk."
-
-@tool
-def specialist_post_to_channel(message: str) -> str:
-    """Post a resolution update to the general channel."""
-    specialist_relay.post_sync("general", message)
-    return "Posted to general channel."
-
-@tool
-def specialist_check_inbox() -> str:
-    """Check inbox for escalations from front-desk."""
-    messages = specialist_relay.inbox_sync()
-    if not messages:
-        return "No new messages."
-    return "\n".join(f"From {m.sender}: {m.text}" for m in messages)
+def classify(query: str) -> str:
+    lower = query.lower()
+    for topic in COMPLEX_TOPICS:
+        if topic.replace("_", " ") in lower:
+            return "complex"
+    return "simple"
 
 
-# --- CrewAI Agent Definitions ---
+def simple_answer(query: str) -> str:
+    lower = query.lower()
+    if "hours" in lower or "open" in lower:
+        return "Our business hours are Mon-Fri 9 AM to 6 PM EST."
+    if "shipping" in lower:
+        return "Standard shipping takes 3-5 business days. Express is 1-2 days."
+    if "return" in lower:
+        return "You can return items within 30 days with a receipt."
+    return "Please visit our FAQ at help.example.com for more details."
+
+
+def generate_resolution(cid: str, customer: str, issue: str) -> str:
+    lower = issue.lower()
+    if "billing" in lower or "charged" in lower:
+        return (
+            f"Case {cid}: Reviewed billing records for {customer}. "
+            "Duplicate charge confirmed. Refund of $49.99 initiated — "
+            "expect 3-5 business days."
+        )
+    if "security" in lower or "compromised" in lower:
+        return (
+            f"Case {cid}: Account for {customer} locked. "
+            "Unauthorized transactions reversed. Temporary credentials "
+            "sent to verified email. Reset password within 24h."
+        )
+    return f"Case {cid}: Issue for {customer} reviewed and resolved."
+
+
+# ---------------------------------------------------------------------------
+# Customer interactions
+# ---------------------------------------------------------------------------
+
+CUSTOMERS = [
+    {"name": "Alice", "query": "What are your business hours?"},
+    {"name": "Bob", "query": "I have a billing dispute — I was charged twice for order #1042."},
+    {"name": "Carol", "query": "Security incident: my account appears compromised, unauthorized purchases."},
+]
+
+
+# ---------------------------------------------------------------------------
+# CrewAI Tools — backed by Relay
+# ---------------------------------------------------------------------------
+
+@tool("escalate_to_specialist")
+def escalate_to_specialist(customer_name: str, issue: str) -> str:
+    """Escalate a complex customer issue to the specialist agent via Relay DM."""
+    cid = case_id()
+    escalation = (
+        f"ESCALATION {cid}\nCustomer: {customer_name}\n"
+        f"Issue: {issue}\nPriority: HIGH"
+    )
+    asyncio.get_event_loop().run_until_complete(
+        front_relay.send("specialist", escalation)
+    )
+    asyncio.get_event_loop().run_until_complete(
+        front_relay.post(CHANNEL, f"[Front Desk] {customer_name}'s issue ({cid}) escalated.")
+    )
+    return f"Escalated as {cid}"
+
+
+@tool("post_direct_answer")
+def post_direct_answer(customer_name: str, query: str, answer: str) -> str:
+    """Post a direct answer to the general channel for a simple customer query."""
+    asyncio.get_event_loop().run_until_complete(
+        front_relay.post(CHANNEL, f"[Front Desk] {customer_name} asked: {query}\nAnswer: {answer}")
+    )
+    return f"Answered {customer_name} directly."
+
+
+@tool("check_specialist_inbox")
+def check_specialist_inbox() -> str:
+    """Check the specialist inbox for new escalations via Relay."""
+    messages = asyncio.get_event_loop().run_until_complete(spec_relay.inbox())
+    escalations = [m for m in messages if "ESCALATION" in m.text]
+    if not escalations:
+        return "No escalations in inbox."
+    return "\n---\n".join(m.text for m in escalations)
+
+
+@tool("send_resolution")
+def send_resolution(case_id: str, customer_name: str, resolution_text: str) -> str:
+    """Send a resolution back to front desk via Relay DM and post summary."""
+    asyncio.get_event_loop().run_until_complete(
+        spec_relay.send("front-desk", f"RESOLUTION {case_id}\n{resolution_text}")
+    )
+    asyncio.get_event_loop().run_until_complete(
+        spec_relay.post(CHANNEL, f"[Specialist] Resolved {case_id} for {customer_name}.")
+    )
+    return f"Resolution sent for {case_id}."
+
+
+@tool("check_frontdesk_inbox")
+def check_frontdesk_inbox() -> str:
+    """Check the front desk inbox for specialist resolutions via Relay."""
+    messages = asyncio.get_event_loop().run_until_complete(front_relay.inbox())
+    resolutions = [m for m in messages if "RESOLUTION" in m.text]
+    if not resolutions:
+        return "No resolutions in inbox."
+    return "\n---\n".join(m.text for m in resolutions)
+
+
+# ---------------------------------------------------------------------------
+# CrewAI Agents
+# ---------------------------------------------------------------------------
 
 front_desk_agent = Agent(
-    role="Front Desk Customer Service Representative",
-    goal=(
-        "Handle simple customer queries directly. "
-        "For complex issues (billing disputes, security, legal), "
-        "escalate to the specialist via relay DM."
-    ),
-    backstory=(
-        "You are the first point of contact for customers. "
-        "You handle routine questions about hours, shipping, and returns. "
-        "Complex issues must be escalated to the specialist agent."
-    ),
-    tools=[front_send_to_specialist, front_post_to_channel, front_check_inbox],
+    role="Front Desk Agent",
+    goal="Triage customer queries: answer simple ones directly, escalate complex ones.",
+    backstory="You are the first point of contact for customer service.",
+    tools=[escalate_to_specialist, post_direct_answer],
     verbose=True,
-    allow_delegation=False,
 )
 
 specialist_agent = Agent(
-    role="Customer Service Specialist",
-    goal=(
-        "Receive escalated issues from front-desk, investigate thoroughly, "
-        "and send detailed resolutions back via relay DM."
-    ),
-    backstory=(
-        "You are a senior specialist who handles complex customer issues "
-        "including billing disputes, security incidents, and policy exceptions. "
-        "You always provide case numbers and concrete next steps."
-    ),
-    tools=[specialist_send_to_front, specialist_post_to_channel, specialist_check_inbox],
+    role="Specialist Agent",
+    goal="Resolve escalated customer issues with detailed resolutions.",
+    backstory="You are a senior specialist handling billing disputes and security incidents.",
+    tools=[check_specialist_inbox, send_resolution],
     verbose=True,
-    allow_delegation=False,
+)
+
+followup_agent = Agent(
+    role="Follow-up Agent",
+    goal="Retrieve specialist resolutions and post them to the channel.",
+    backstory="You close the loop by relaying specialist responses.",
+    tools=[check_frontdesk_inbox],
+    verbose=True,
 )
 
 
-def build_triage_task(customer_name: str, query: str) -> Task:
-    return Task(
-        description=(
-            f"Customer '{customer_name}' asks: '{query}'\n\n"
-            "If this is a simple question (hours, shipping, returns, general), "
-            "answer directly and post the answer to the general channel.\n"
-            "If this is complex (billing dispute, account security, legal, refund denied), "
-            "use the front_send_to_specialist tool to escalate, "
-            "then post an escalation notice to the general channel."
-        ),
-        expected_output="A direct answer or confirmation that the query was escalated.",
-        agent=front_desk_agent,
-    )
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+
+def build_triage_description() -> str:
+    lines = ["Triage the following customer queries:\n"]
+    for c in CUSTOMERS:
+        cat = classify(c["query"])
+        lines.append(f"- {c['name']}: \"{c['query']}\" → {cat}")
+        if cat == "simple":
+            lines.append(f"  Answer: {simple_answer(c['query'])}")
+    return "\n".join(lines)
 
 
-def build_specialist_task() -> Task:
-    return Task(
-        description=(
-            "Check your inbox for escalations from front-desk. "
-            "For each escalation:\n"
-            "1. Analyze the issue\n"
-            "2. Generate a detailed resolution with a case number\n"
-            "3. Send the resolution back to front-desk via DM\n"
-            "4. Post a summary to the general channel"
-        ),
-        expected_output="Resolution details for all processed escalations.",
-        agent=specialist_agent,
-    )
+triage_task = Task(
+    description=build_triage_description(),
+    expected_output="Each customer handled or escalated.",
+    agent=front_desk_agent,
+)
+
+specialist_task = Task(
+    description="Check your inbox for escalations and resolve each one.",
+    expected_output="All escalations resolved with case numbers.",
+    agent=specialist_agent,
+)
+
+followup_task = Task(
+    description="Check the front-desk inbox for resolutions and report them.",
+    expected_output="All resolutions retrieved and posted.",
+    agent=followup_agent,
+)
 
 
-def build_followup_task() -> Task:
-    return Task(
-        description=(
-            "Check your inbox for specialist responses. "
-            "Summarize any resolutions received and post a final update "
-            "to the general channel confirming the issues are resolved."
-        ),
-        expected_output="Summary of all resolved escalations.",
-        agent=front_desk_agent,
-    )
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-
-async def run_demo():
+async def main() -> None:
     print("=" * 60)
-    print("Customer Service Escalation App — CrewAI")
+    print("Customer Service Escalation — CrewAI")
     print("=" * 60)
 
-    async with front_relay, specialist_relay:
+    await front_relay.connect()
+    await spec_relay.connect()
+    print("Relay agents connected.\n")
 
-        customer_queries = [
-            ("Alice", "What are your business hours?"),
-            ("Bob", "I have a billing dispute — I was charged twice for order #12345"),
-            ("Carol", "My account was compromised and someone made unauthorized purchases"),
-        ]
+    crew = Crew(
+        agents=[front_desk_agent, specialist_agent, followup_agent],
+        tasks=[triage_task, specialist_task, followup_task],
+        process=Process.sequential,
+        verbose=True,
+    )
 
-        # Phase 1: Front desk triages all queries
-        print("\n--- Phase 1: Front Desk Triage ---")
-        triage_tasks = [build_triage_task(name, query) for name, query in customer_queries]
+    result = crew.kickoff()
+    print("\n--- Crew Result ---")
+    print(result)
 
-        triage_crew = Crew(
-            agents=[front_desk_agent],
-            tasks=triage_tasks,
-            process=Process.sequential,
-            verbose=True,
-        )
-        triage_result = triage_crew.kickoff()
-        print(f"\nTriage result: {triage_result}")
-
-        await asyncio.sleep(2)
-
-        # Phase 2: Specialist processes escalations
-        print("\n--- Phase 2: Specialist Processing ---")
-        specialist_task = build_specialist_task()
-
-        specialist_crew = Crew(
-            agents=[specialist_agent],
-            tasks=[specialist_task],
-            process=Process.sequential,
-            verbose=True,
-        )
-        specialist_result = specialist_crew.kickoff()
-        print(f"\nSpecialist result: {specialist_result}")
-
-        await asyncio.sleep(2)
-
-        # Phase 3: Front desk checks for responses
-        print("\n--- Phase 3: Front Desk Follow-up ---")
-        followup_task = build_followup_task()
-
-        followup_crew = Crew(
-            agents=[front_desk_agent],
-            tasks=[followup_task],
-            process=Process.sequential,
-            verbose=True,
-        )
-        followup_result = followup_crew.kickoff()
-        print(f"\nFollow-up result: {followup_result}")
-
-        print("\n" + "=" * 60)
-        print("Demo complete!")
+    await front_relay.close()
+    await spec_relay.close()
+    print("=" * 60)
+    print("Done.")
 
 
 if __name__ == "__main__":
-    asyncio.run(run_demo())
+    asyncio.run(main())
