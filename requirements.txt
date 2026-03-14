@@ -1,0 +1,18 @@
+# Core
+agent-relay
+httpx>=0.24.0
+asyncio-compat>=0.1.0
+
+# Framework variants (optional)
+crewai>=0.80.0
+openai-agents>=0.1.0
+langgraph>=0.2.0
+google-adk>=0.5.0
+
+# Integrations server
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# OpenRouter support (optional)
+openai>=1.0.0
+python-dotenv>=1.0.0

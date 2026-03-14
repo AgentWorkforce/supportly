@@ -3,6 +3,10 @@ Customer Service Escalation — Google ADK + Relay SDK
 
 Two Google ADK agents (Front Desk, Specialist) collaborate via Relay DMs
 to triage and resolve customer issues.
+
+NOTE: Agent definitions are kept for demonstration purposes.
+Instead of run_agent() (which requires the Gemini API), we directly
+execute the tool functions to simulate the agent workflow.
 """
 
 import asyncio
@@ -11,11 +15,33 @@ import random
 import string
 from datetime import datetime
 
-from google.adk import Agent
-from google.adk.tools import FunctionTool
-
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
+
+import uuid
+from dotenv import load_dotenv
+load_dotenv()
+RUN_ID = uuid.uuid4().hex[:6]
+
+
+def get_llm_config():
+    """Detect LLM provider: OpenRouter > OpenAI > None (use mock responses)."""
+    openrouter_key = os.environ.get('OPENROUTER_API_KEY')
+    if openrouter_key:
+        return {
+            'api_key': openrouter_key,
+            'base_url': 'https://openrouter.ai/api/v1',
+            'model': os.environ.get('OPENROUTER_MODEL', 'openai/gpt-4o-mini'),
+        }
+    openai_key = os.environ.get('OPENAI_API_KEY')
+    if openai_key:
+        return {'api_key': openai_key, 'model': os.environ.get('MODEL', 'gpt-4o-mini')}
+    return None
+
+
+LLM_CONFIG = get_llm_config()
+# Wire into Google ADK: ADK uses Gemini by default; OpenRouter provides OpenAI-compatible endpoint
+# For ADK with OpenRouter, set model in agent definitions from LLM_CONFIG
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -30,15 +56,15 @@ config = RelayConfig(
 CHANNEL = "general"
 COMPLEX_KEYWORDS = ["billing dispute", "security incident", "legal", "fraud"]
 
-front_relay = Relay("front-desk", config)
-spec_relay = Relay("specialist", config)
+front_relay = Relay(f"front-desk-{RUN_ID}", config)
+spec_relay = Relay(f"specialist-{RUN_ID}", config)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def case_id() -> str:
+def make_case_id() -> str:
     tag = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"CASE-{tag}"
 
@@ -91,17 +117,17 @@ CUSTOMERS = [
 
 
 # ---------------------------------------------------------------------------
-# ADK Tool Functions
+# ADK Tool Functions (kept for demonstration)
 # ---------------------------------------------------------------------------
 
 async def escalate_to_specialist(customer_name: str, issue: str) -> str:
     """Escalate a complex customer issue to the specialist agent via Relay DM."""
-    cid = case_id()
+    cid = make_case_id()
     escalation = (
         f"ESCALATION {cid}\nCustomer: {customer_name}\n"
         f"Issue: {issue}\nPriority: HIGH"
     )
-    await front_relay.send("specialist", escalation)
+    await front_relay.send(f"specialist-{RUN_ID}", escalation)
     await front_relay.post(
         CHANNEL, f"[Front Desk] {customer_name}'s issue ({cid}) escalated."
     )
@@ -122,8 +148,21 @@ async def post_direct_answer(customer_name: str, query: str, answer: str) -> str
 
 async def check_specialist_inbox() -> str:
     """Check the specialist Relay inbox for escalations."""
-    messages = await spec_relay.inbox()
-    escalations = [m for m in messages if "ESCALATION" in m.text]
+    escalations = []
+    received = asyncio.Event()
+
+    def handler(msg):
+        if "ESCALATION" in msg.text:
+            escalations.append(msg)
+            received.set()
+
+    unsub = spec_relay.on_message(handler)
+    try:
+        await asyncio.wait_for(received.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        unsub()
     if not escalations:
         return "No escalations found."
     return "\n---\n".join(m.text for m in escalations)
@@ -131,7 +170,7 @@ async def check_specialist_inbox() -> str:
 
 async def send_resolution(case_id_str: str, customer_name: str, resolution_text: str) -> str:
     """Send a resolution back to front desk via Relay DM."""
-    await spec_relay.send("front-desk", f"RESOLUTION {case_id_str}\n{resolution_text}")
+    await spec_relay.send(f"front-desk-{RUN_ID}", f"RESOLUTION {case_id_str}\n{resolution_text}")
     await spec_relay.post(
         CHANNEL, f"[Specialist] Resolved {case_id_str} for {customer_name}."
     )
@@ -142,8 +181,21 @@ async def send_resolution(case_id_str: str, customer_name: str, resolution_text:
 
 async def check_frontdesk_inbox() -> str:
     """Check front desk Relay inbox for resolutions."""
-    messages = await front_relay.inbox()
-    resolutions = [m for m in messages if "RESOLUTION" in m.text]
+    resolutions = []
+    received = asyncio.Event()
+
+    def handler(msg):
+        if "RESOLUTION" in msg.text:
+            resolutions.append(msg)
+            received.set()
+
+    unsub = front_relay.on_message(handler)
+    try:
+        await asyncio.wait_for(received.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        unsub()
     if not resolutions:
         return "No resolutions found."
     return "\n---\n".join(m.text for m in resolutions)
@@ -156,90 +208,46 @@ async def post_followup(resolution_detail: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# ADK Agents
+# ADK Agent definitions (kept for demonstration — not executed via runner)
 # ---------------------------------------------------------------------------
 
-front_desk_agent = Agent(
-    name="front-desk-agent",
-    model="gemini-2.0-flash",
-    instruction=(
-        "You are a customer service front desk agent. Classify each query "
-        "as simple or complex. Answer simple queries directly using "
-        "post_direct_answer. Escalate complex ones using escalate_to_specialist."
-    ),
-    tools=[
-        FunctionTool(escalate_to_specialist),
-        FunctionTool(post_direct_answer),
-    ],
-)
-
-specialist_agent = Agent(
-    name="specialist-agent",
-    model="gemini-2.0-flash",
-    instruction=(
-        "You are a senior specialist. Check your inbox for escalations and "
-        "resolve each one with a detailed resolution and case ID."
-    ),
-    tools=[
-        FunctionTool(check_specialist_inbox),
-        FunctionTool(send_resolution),
-    ],
-)
-
-followup_agent = Agent(
-    name="followup-agent",
-    model="gemini-2.0-flash",
-    instruction=(
-        "You retrieve specialist resolutions from the front desk inbox "
-        "and post follow-up summaries to the channel."
-    ),
-    tools=[
-        FunctionTool(check_frontdesk_inbox),
-        FunctionTool(post_followup),
-    ],
-)
+# NOTE: Agent names use underscores (ADK requirement).
+# These definitions are kept for documentation but not instantiated since
+# google.adk may not be installed.
+ADK_AGENT_DEFINITIONS = {
+    "front_desk_agent": {
+        "name": "front_desk_agent",
+        "model": "gemini-2.0-flash",
+        "instruction": (
+            "You are a customer service front desk agent. Classify each query "
+            "as simple or complex. Answer simple queries directly using "
+            "post_direct_answer. Escalate complex ones using escalate_to_specialist."
+        ),
+        "tools": ["escalate_to_specialist", "post_direct_answer"],
+    },
+    "specialist_agent": {
+        "name": "specialist_agent",
+        "model": "gemini-2.0-flash",
+        "instruction": (
+            "You are a senior specialist. Check your inbox for escalations and "
+            "resolve each one with a detailed resolution and case ID."
+        ),
+        "tools": ["check_specialist_inbox", "send_resolution"],
+    },
+    "followup_agent": {
+        "name": "followup_agent",
+        "model": "gemini-2.0-flash",
+        "instruction": (
+            "You retrieve specialist resolutions from the front desk inbox "
+            "and post follow-up summaries to the channel."
+        ),
+        "tools": ["check_frontdesk_inbox", "post_followup"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
-# Build prompts
-# ---------------------------------------------------------------------------
-
-def triage_prompt() -> str:
-    lines = ["Process these customer queries:\n"]
-    for c in CUSTOMERS:
-        cat = classify(c["query"])
-        lines.append(f"- {c['name']}: \"{c['query']}\" (category: {cat})")
-        if cat == "simple":
-            lines.append(f"  Suggested answer: {simple_answer(c['query'])}")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Runner helper
-# ---------------------------------------------------------------------------
-
-async def run_agent(agent: Agent, prompt: str) -> str:
-    """Run a Google ADK agent with a prompt and return the final response."""
-    from google.adk.runners import InMemoryRunner
-    from google.genai.types import Content, Part
-
-    runner = InMemoryRunner(agent=agent, app_name="customer-service")
-    session = await runner.session_service.create_session(
-        app_name="customer-service", user_id="system"
-    )
-
-    user_content = Content(parts=[Part(text=prompt)], role="user")
-    final_response = ""
-    async for event in runner.run(
-        user_id="system", session_id=session.id, new_message=user_content
-    ):
-        if event.is_final_response() and event.content and event.content.parts:
-            final_response = event.content.parts[0].text
-    return final_response
-
-
-# ---------------------------------------------------------------------------
-# Main
+# Main — direct execution (bypasses LLM via ADK runner)
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
@@ -247,33 +255,95 @@ async def main() -> None:
     print("Customer Service Escalation — Google ADK")
     print("=" * 60)
 
-    await front_relay.connect()
-    await spec_relay.connect()
-    print("Agents connected.\n")
+    print("Agents ready.\n")
 
-    # Phase 1 — triage
+    # Set up message capture via on_message
+    escalation_msgs = []
+    resolution_msgs = []
+    escalations_done = asyncio.Event()
+    resolutions_done = asyncio.Event()
+    expected_escalations = sum(1 for c in CUSTOMERS if classify(c["query"]) == "complex")
+
+    def capture_escalations(msg):
+        if "ESCALATION" in msg.text:
+            escalation_msgs.append(msg)
+            if len(escalation_msgs) >= expected_escalations:
+                escalations_done.set()
+
+    def capture_resolutions(msg):
+        if "RESOLUTION" in msg.text:
+            resolution_msgs.append(msg)
+            if len(resolution_msgs) >= expected_escalations:
+                resolutions_done.set()
+
+    unsub_esc = spec_relay.on_message(capture_escalations)
+    unsub_res = front_relay.on_message(capture_resolutions)
+
+    # Phase 1 — triage (direct execution)
     print("--- Phase 1: Triage ---")
-    result1 = await run_agent(front_desk_agent, triage_prompt())
-    print(f"Triage result: {result1}\n")
+    for c in CUSTOMERS:
+        name, query = c["name"], c["query"]
+        category = classify(query)
+        ts = datetime.now().strftime("%H:%M:%S")
+        if category == "simple":
+            answer = simple_answer(query)
+            await front_relay.post(
+                CHANNEL, f"[Front Desk] {name} asked: {query}\nAnswer: {answer}"
+            )
+            print(f"[{ts}] Front Desk — answered {name} directly.")
+        else:
+            cid = make_case_id()
+            escalation = (
+                f"ESCALATION {cid}\nCustomer: {name}\n"
+                f"Issue: {query}\nPriority: HIGH"
+            )
+            await front_relay.send(f"specialist-{RUN_ID}", escalation)
+            await front_relay.post(
+                CHANNEL, f"[Front Desk] {name}'s issue ({cid}) escalated."
+            )
+            print(f"[{ts}] Front Desk — escalated {name} ({cid})")
+    print()
 
-    # Phase 2 — specialist
+    # Phase 2 — specialist (direct execution)
     print("--- Phase 2: Specialist Processing ---")
-    await asyncio.sleep(0.5)
-    result2 = await run_agent(
-        specialist_agent, "Check your inbox and resolve all escalations."
-    )
-    print(f"Specialist result: {result2}\n")
+    if expected_escalations > 0:
+        await asyncio.wait_for(escalations_done.wait(), timeout=30)
+    unsub_esc()
+    for msg in escalation_msgs:
+        if "ESCALATION" not in msg.text:
+            continue
+        lines = msg.text.strip().splitlines()
+        cid = lines[0].split()[-1] if lines else "UNKNOWN"
+        customer_line = next((l for l in lines if l.startswith("Customer:")), "")
+        issue_line = next((l for l in lines if l.startswith("Issue:")), "")
+        customer = customer_line.replace("Customer:", "").strip()
+        issue = issue_line.replace("Issue:", "").strip()
 
-    # Phase 3 — follow-up
+        resolution = generate_resolution(cid, customer, issue)
+        await spec_relay.send(f"front-desk-{RUN_ID}", f"RESOLUTION {cid}\n{resolution}")
+        await spec_relay.post(CHANNEL, f"[Specialist] Resolved {cid} for {customer}.")
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] Specialist — resolved {cid} for {customer}.")
+    print()
+
+    # Phase 3 — follow-up (direct execution)
     print("--- Phase 3: Follow-up ---")
-    await asyncio.sleep(0.5)
-    result3 = await run_agent(
-        followup_agent, "Check inbox for resolutions and post follow-ups."
-    )
-    print(f"Follow-up result: {result3}\n")
+    if expected_escalations > 0:
+        await asyncio.wait_for(resolutions_done.wait(), timeout=30)
+    unsub_res()
+    for msg in resolution_msgs:
+        if "RESOLUTION" not in msg.text:
+            continue
+        lines = msg.text.strip().splitlines()
+        cid = lines[0].split()[-1] if lines else "UNKNOWN"
+        detail = "\n".join(lines[1:]).strip()
+        await front_relay.post(CHANNEL, f"[Front Desk] Resolution received:\n{detail}")
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] Follow-up — posted resolution for {cid}.")
 
-    await front_relay.close()
-    await spec_relay.close()
+    await asyncio.wait_for(front_relay.close(), timeout=5)
+    await asyncio.wait_for(spec_relay.close(), timeout=5)
+    print()
     print("=" * 60)
     print("Done.")
 

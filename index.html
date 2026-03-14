@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Customer Service — Agent Relay</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { theme: { extend: { colors: {
+      surface: { 950:'#030712', 900:'#0B0F19', 800:'#111827', 700:'#1F2937' },
+      accent: { DEFAULT:'#6366F1', light:'#818CF8' },
+    }}}}
+  </script>
+  <style>
+    .glass{background:rgba(17,24,39,.6);backdrop-filter:blur(16px);border:1px solid rgba(99,102,241,.05)}
+    @keyframes fadeUp{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+    .fade-up{animation:fadeUp .2s ease-out}
+    @keyframes pulse{0%,100%{opacity:.3}50%{opacity:1}}.pulse{animation:pulse 1s ease-in-out infinite}
+    .relay-line{border-left:2px solid #6366F1}
+    .c-emerald{color:#34d399}.c-amber{color:#fbbf24}.c-red{color:#f87171}.c-blue{color:#60a5fa}.c-slate{color:#94a3b8}
+    .bg-emerald{background:rgba(52,211,153,.08)}.bg-amber{background:rgba(251,191,36,.08)}
+    .bg-red{background:rgba(248,113,113,.08)}.bg-blue{background:rgba(96,165,250,.08)}.bg-slate{background:rgba(148,163,184,.05)}
+    .dot-emerald{background:#34d399}.dot-amber{background:#fbbf24}.dot-red{background:#f87171}.dot-blue{background:#60a5fa}.dot-slate{background:#94a3b8}
+  </style>
+</head>
+<body class="bg-surface-950 text-slate-300 min-h-screen antialiased text-sm">
+  <div class="fixed inset-0 z-0 pointer-events-none">
+    <div class="absolute top-[-10%] left-[-10%] w-[35%] h-[35%] bg-accent/5 rounded-full blur-[120px]"></div>
+  </div>
+  <div class="relative z-10 flex flex-col min-h-screen">
+
+    <!-- Nav -->
+    <nav class="glass sticky top-0 z-50">
+      <div class="max-w-7xl mx-auto px-4 h-10 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <span class="text-xs font-bold text-white">Supportly</span>
+          <div class="h-3 w-px bg-slate-700"></div>
+          <img src="assets/agent-relay-icon-white.svg" alt="" class="h-3 opacity-30" />
+        </div>
+        <div class="flex items-center gap-3 text-[9px]" id="nav-dots"></div>
+      </div>
+    </nav>
+
+    <main class="max-w-7xl mx-auto px-4 py-4 flex-1 w-full">
+      <div class="grid grid-cols-12 gap-4">
+
+        <!-- Col 1: Input + Agents -->
+        <div class="col-span-3 space-y-3">
+          <div class="glass rounded-lg p-3">
+            <div class="text-[9px] font-bold text-white uppercase tracking-wider mb-2">New Ticket</div>
+            <input id="name" type="text" value="Khaliq" class="w-full bg-surface-800 border border-slate-700/20 rounded px-2 py-1 text-xs text-white mb-1 focus:border-accent/40 focus:outline-none" />
+            <textarea id="query" rows="2" placeholder="Describe your issue..." class="w-full bg-surface-800 border border-slate-700/20 rounded px-2 py-1 text-xs text-white mb-1 focus:border-accent/40 focus:outline-none resize-none" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();send()}"></textarea>
+            <button onclick="send()" class="w-full bg-accent hover:bg-accent/80 text-white py-1 rounded text-xs font-medium">Submit</button>
+            <div class="flex flex-wrap gap-1 mt-1.5">
+              <button onclick="q('What are your hours?')" class="text-[8px] bg-surface-800/50 border border-slate-700/10 rounded-full px-1.5 py-0.5 hover:bg-surface-700">💬 Simple</button>
+              <button onclick="q('Charged twice for order #1042, need refund')" class="text-[8px] bg-surface-800/50 border border-slate-700/10 rounded-full px-1.5 py-0.5 hover:bg-surface-700">💰 Billing</button>
+              <button onclick="q('Account compromised — unauthorized purchases on my card')" class="text-[8px] bg-surface-800/50 border border-slate-700/10 rounded-full px-1.5 py-0.5 hover:bg-surface-700">🔒 Security</button>
+              <button onclick="q('App crashes when uploading files over 10MB')" class="text-[8px] bg-surface-800/50 border border-slate-700/10 rounded-full px-1.5 py-0.5 hover:bg-surface-700">🐛 Technical</button>
+            </div>
+          </div>
+
+          <!-- Agent roster -->
+          <div class="glass rounded-lg p-3" id="roster">
+            <div class="text-[9px] font-bold text-white uppercase tracking-wider mb-2">Agent Network</div>
+            <div class="text-[10px] text-slate-600 italic">Starting agents...</div>
+          </div>
+
+          <!-- Cost comparison -->
+          <div class="glass rounded-lg p-3" id="cost-panel" style="display:none">
+            <div class="text-[9px] font-bold text-white uppercase tracking-wider mb-2">Why Multi-Agent Wins</div>
+            <div class="space-y-1.5">
+              <div>
+                <div class="flex justify-between text-[9px] mb-0.5"><span class="text-emerald-400">Multi-Agent</span><span class="text-white font-mono" id="mc">$0</span></div>
+                <div class="h-1 bg-surface-800 rounded-full"><div id="mb" class="h-full bg-emerald-500 rounded-full transition-all" style="width:0"></div></div>
+              </div>
+              <div>
+                <div class="flex justify-between text-[9px] mb-0.5"><span class="text-red-400">Single Agent</span><span class="text-white font-mono" id="sc">$0</span></div>
+                <div class="h-1 bg-surface-800 rounded-full"><div id="sb" class="h-full bg-red-500 rounded-full transition-all" style="width:0"></div></div>
+              </div>
+              <div class="pt-1.5 border-t border-slate-800/30 text-center">
+                <span class="text-lg font-black text-emerald-400" id="save">—</span>
+                <div class="text-[8px] text-slate-600">cost reduction</div>
+              </div>
+              <div class="text-[8px] text-slate-600 pt-1 border-t border-slate-800/30 space-y-0.5">
+                <div>📊 <span id="st">0</span> tickets: <span class="text-emerald-400" id="ss">0</span> simple (free) · <span class="text-amber-400" id="se">0</span> escalated</div>
+                <div>💡 Simple queries → free model ($0)</div>
+                <div>💡 Only complex queries use premium model</div>
+                <div>💡 Single agent uses premium for EVERYTHING</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Col 2: Live Feed -->
+        <div class="col-span-9">
+          <div class="glass rounded-lg p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[9px] font-bold text-white uppercase tracking-wider">Live Agent Communication</div>
+              <span class="text-[8px] text-slate-600" id="ec">0 events</span>
+            </div>
+            <div id="feed" class="space-y-1.5 max-h-[calc(100vh-130px)] overflow-y-auto pr-1">
+              <div class="text-xs text-slate-600 py-16 text-center">
+                <div class="text-base mb-2">👆</div>
+                Submit a ticket and watch 5 independent agents<br>
+                communicate in real-time via Agent Relay
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="border-t border-slate-800/15 py-2">
+      <div class="max-w-7xl mx-auto px-4 flex items-center justify-between">
+        <div class="flex items-center gap-1.5">
+          <img src="assets/agent-relay-logo-white.svg" alt="" class="h-2 opacity-15" />
+          <span class="text-[8px] text-slate-700">Powered by Agent Relay</span>
+        </div>
+        <a href="https://agentrelay.dev" class="text-[8px] text-slate-700 hover:text-slate-400">agentrelay.dev</a>
+      </div>
+    </footer>
+  </div>
+
+<script>
+let ws, feed=document.getElementById('feed'), started=false, cnt=0;
+const colors={emerald:'emerald',amber:'amber',red:'red',blue:'blue',slate:'slate'};
+const agents={};
+
+function connect(){
+  ws=new WebSocket(`ws://${location.host}/ws`);
+  ws.onclose=()=>setTimeout(connect,2000);
+  ws.onmessage=e=>handle(JSON.parse(e.data));
+}
+
+function handle(ev){
+  if(ev.type==='agent_online'){agentOnline(ev);return;}
+  if(ev.type==='stats'){updateStats(ev);return;}
+  if(!started){feed.innerHTML='';started=true;}
+
+  const c = ev.color||'slate';
+
+  switch(ev.type){
+    case 'ticket_created':
+      add(`<div class="bg-surface-800/60 border border-slate-700/15 rounded-lg px-3 py-2">
+        <div class="flex items-center gap-2"><span class="text-white font-medium">📩 ${ev.customer}</span>
+        <span class="text-[8px] text-slate-600 font-mono">${ev.tid}</span>
+        <span class="text-[8px] text-slate-600">${ev.timestamp}</span></div>
+        <div class="text-slate-300 mt-0.5">${ev.query}</div></div>`);
+      break;
+
+    case 'thinking':
+      add(`<div class="flex items-center gap-2 px-3 py-1">
+        <span class="w-1.5 h-1.5 rounded-full dot-${c} pulse"></span>
+        <span class="text-[10px] c-${c} font-medium">${ev.agent}</span>
+        <span class="text-[10px] text-slate-500">${ev.detail}</span>
+        <span class="text-[8px] text-slate-700 font-mono ml-auto">${ev.model}</span></div>`);
+      break;
+
+    case 'model_used':
+      add(`<div class="flex items-center gap-2 px-3 py-0.5 text-[8px] text-slate-600">
+        <span class="c-${c}">${ev.agent}</span>
+        <span>⚡ ${ev.ms}ms</span>
+        <span>📊 ${ev.tokens} tokens</span>
+        <span class="${ev.cost>0?'text-amber-400':'text-emerald-400'}">${ev.cost>0?'$'+ev.cost.toFixed(6):'FREE ✨'}</span>
+        <span class="font-mono text-slate-700">${ev.model}</span></div>`);
+      break;
+
+    case 'triage_result':
+      if(ev.action==='escalate'){
+        add(`<div class="border-l-2 border-amber-500/30 bg-amber/50 rounded-r-lg px-3 py-2">
+          <div class="flex items-center gap-2 mb-0.5">
+            <span class="text-[10px] c-emerald font-medium">Front Desk</span>
+            <span class="text-[8px] px-1.5 py-0.5 rounded bg-amber-400/10 text-amber-400 font-medium">ROUTING → specialist</span>
+            <span class="text-[8px] text-slate-500">${ev.category} · ${ev.urgency}</span></div>
+          <div class="text-[10px] text-slate-400">${ev.summary}</div></div>`);
+      } else {
+        add(`<div class="border-l-2 border-emerald-500/30 bg-emerald/50 rounded-r-lg px-3 py-2">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="text-[10px] c-emerald font-medium">Front Desk</span>
+            <span class="text-[8px] px-1.5 py-0.5 rounded bg-emerald-400/10 text-emerald-400 font-medium">ANSWERED DIRECTLY</span>
+            <span class="text-[8px] text-emerald-400">💰 $0 — free model</span></div>
+          <div class="text-slate-200 leading-relaxed whitespace-pre-wrap">${ev.response}</div></div>`);
+      }
+      break;
+
+    case 'channel_post':
+      add(`<div class="relay-line bg-accent/5 rounded-r-lg px-3 py-1.5 border border-accent/8">
+        <div class="flex items-center gap-1.5 text-[9px]">
+          <span class="text-accent font-bold">📡 CHANNEL POST</span>
+          <span class="font-mono text-accent/50">${ev.from_name}</span>
+          <span class="text-accent">→</span>
+          <span class="font-mono text-accent/50">#${ev.channel}</span></div>
+        <div class="text-[9px] text-slate-400 mt-0.5">${ev.detail}</div>
+        <div class="text-[8px] text-slate-600 mt-0.5 italic">All specialists listening — the right one will pick this up</div></div>`);
+      break;
+
+    case 'context_loaded':
+      add(`<div class="flex items-center gap-2 px-3 py-1 text-[9px]">
+        <span class="text-accent">📂 DATA LOADED</span>
+        <span class="c-${ev.color||'slate'}">${ev.agent}</span>
+        <span class="text-slate-500">pulled context from:</span>
+        ${ev.sources.map(s=>`<span class="font-mono text-slate-400 bg-surface-800 px-1 rounded">${s}</span>`).join(' ')}
+        <span class="${ev.is_live?'text-emerald-400':'text-amber-400'}">${ev.is_live?'🟢 LIVE':'🟡 DEMO'}</span>
+      </div>`);
+      break;
+
+    case 'specialist_pickup':
+      add(`<div class="bg-${c} border-l-2 border-${c==='amber'?'amber':c==='red'?'red':c==='blue'?'blue':'slate'}-500/30 rounded-r-lg px-3 py-1.5">
+        <div class="flex items-center gap-2">
+          <span class="text-[10px] c-${c} font-bold">🙋 ${ev.agent} PICKS UP</span>
+          <span class="text-[8px] text-slate-500 font-mono">${ev.tid}</span></div>
+        <div class="text-[10px] text-slate-400">${ev.detail}</div></div>`);
+      break;
+
+    case 'resolution':
+      add(`<div class="border-l-2 border-${c==='amber'?'amber':c==='red'?'red':c==='blue'?'blue':'slate'}-500/30 bg-${c} rounded-r-lg px-3 py-2">
+        <div class="flex items-center gap-2 mb-1">
+          <span class="text-[10px] c-${c} font-bold">${ev.agent}</span>
+          <span class="text-[8px] px-1.5 py-0.5 rounded bg-${c==='amber'?'amber':c==='red'?'red':c==='blue'?'blue':'slate'}-400/10 c-${c} font-medium">RESOLUTION</span></div>
+        <div class="text-slate-200 leading-relaxed whitespace-pre-wrap">${ev.text}</div></div>`);
+      break;
+
+    case 'relay_dm':
+      add(`<div class="relay-line bg-accent/5 rounded-r-lg px-3 py-1.5 border border-accent/8">
+        <div class="flex items-center gap-1.5 text-[9px]">
+          <span class="text-accent font-bold">✉️ RELAY DM</span>
+          <span class="text-white font-medium">${ev.from_agent||'Agent'}</span>
+          <span class="font-mono text-accent/30 text-[7px]">${ev.from_name||''}</span>
+          <span class="text-accent">→</span>
+          <span class="text-white font-medium">${ev.to_agent||'Agent'}</span>
+          <span class="font-mono text-accent/30 text-[7px]">${ev.to_name||''}</span>
+          <span class="text-slate-600 font-mono">${ev.tid||''}</span></div>
+        <div class="text-[9px] text-slate-400 mt-0.5">${ev.preview}</div></div>`);
+      break;
+
+    case 'followup':
+      add(`<div class="px-3 py-1 text-[10px] text-slate-400">📧 ${ev.detail}</div>`);
+      break;
+
+    case 'complete':
+      add(`<div class="text-center py-1.5">
+        <span class="text-[9px] px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/15">
+          ✅ ${ev.tid} — ${ev.resolved_by}${ev.cost_note?' · '+ev.cost_note:''}
+        </span></div>`);
+      break;
+
+    case 'qa_score':
+      const s=ev.scores;
+      const avg=((s.empathy||0)+(s.completeness||0)+(s.actionability||0))/3;
+      const stars='★'.repeat(Math.round(avg))+'☆'.repeat(5-Math.round(avg));
+      add(`<div class="bg-slate rounded-lg px-3 py-1.5 border border-slate-700/10">
+        <div class="flex items-center gap-2 text-[9px]">
+          <span class="c-slate font-medium">🔍 QA Monitor</span>
+          <span class="text-slate-600">reviewed ${ev.agent}'s resolution</span>
+          <span class="text-amber-400 ml-auto">${stars}</span>
+          <span class="text-white font-bold">${avg.toFixed(1)}/5</span></div>
+        <div class="flex gap-3 text-[8px] text-slate-500 mt-0.5">
+          <span>Empathy: ${s.empathy}/5</span>
+          <span>Complete: ${s.completeness}/5</span>
+          <span>Actionable: ${s.actionability}/5</span></div>
+        ${s.note?`<div class="text-[8px] text-slate-500 italic mt-0.5">"${s.note}"</div>`:''}</div>`);
+      break;
+  }
+  cnt++;document.getElementById('ec').textContent=cnt+' events';
+  feed.scrollTop=feed.scrollHeight;
+}
+
+function agentOnline(ev){
+  agents[ev.agent]=ev;
+  // Nav dots
+  document.getElementById('nav-dots').innerHTML=Object.values(agents).map(a=>
+    `<div class="flex items-center gap-0.5"><div class="w-1 h-1 rounded-full dot-${a.color}"></div><span class="text-slate-500">${a.agent}</span></div>`
+  ).join('');
+  // Roster
+  document.getElementById('roster').innerHTML=
+    `<div class="text-[9px] font-bold text-white uppercase tracking-wider mb-2">Agent Network · ${Object.keys(agents).length} online</div>`+
+    Object.values(agents).map(a=>`
+      <div class="bg-${a.color} rounded px-2 py-1.5 mb-1.5 border border-${a.color==='amber'?'amber':a.color==='red'?'red':a.color==='blue'?'blue':a.color==='emerald'?'emerald':'slate'}-500/10">
+        <div class="flex items-center gap-1.5">
+          <div class="w-1.5 h-1.5 rounded-full dot-${a.color}"></div>
+          <span class="text-[10px] text-white font-medium">${a.agent}</span>
+          <span class="text-[8px] text-slate-500 ml-auto">${a.role}</span></div>
+        <div class="text-[8px] text-slate-500 mt-0.5">Model: <code class="text-slate-400">${a.model}</code></div>
+        <div class="text-[8px] text-slate-600">${a.desc}</div>
+      </div>
+    `).join('');
+  // Feed
+  if(!started){feed.innerHTML='';started=true;}
+  add(`<div class="text-center text-[9px] text-slate-500 py-0.5">
+    <span class="dot-${ev.color} inline-block w-1.5 h-1.5 rounded-full mr-1"></span>
+    <strong class="c-${ev.color}">${ev.agent}</strong> online · <code class="text-slate-600">${ev.name}</code> · ${ev.role}
+  </div>`);
+}
+
+function updateStats(ev){
+  document.getElementById('cost-panel').style.display='block';
+  document.getElementById('mc').textContent='$'+ev.multi_cost.toFixed(6);
+  document.getElementById('sc').textContent='$'+ev.mono_cost.toFixed(6);
+  document.getElementById('st').textContent=ev.total;
+  document.getElementById('ss').textContent=ev.simple;
+  document.getElementById('se').textContent=ev.escalated;
+  const mx=Math.max(ev.multi_cost,ev.mono_cost,0.000001);
+  document.getElementById('mb').style.width=(ev.multi_cost/mx*100)+'%';
+  document.getElementById('sb').style.width=(ev.mono_cost/mx*100)+'%';
+  document.getElementById('save').textContent=ev.savings_pct>0?ev.savings_pct+'%':'—';
+}
+
+function add(h){const d=document.createElement('div');d.className='fade-up';d.innerHTML=h;feed.appendChild(d);}
+function q(t){document.getElementById('query').value=t;}
+async function send(){
+  const query=document.getElementById('query').value.trim(),customer=document.getElementById('name').value.trim()||'Customer';
+  if(!query)return;document.getElementById('query').value='';
+  await fetch('/api/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,customer})});
+}
+connect();
+</script>
+</body>
+</html>

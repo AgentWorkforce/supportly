@@ -17,6 +17,30 @@ from langgraph.graph import StateGraph, END
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
 
+import uuid
+from dotenv import load_dotenv
+load_dotenv()
+RUN_ID = uuid.uuid4().hex[:6]
+
+
+def get_llm_config():
+    """Detect LLM provider: OpenRouter > OpenAI > None (use mock responses)."""
+    openrouter_key = os.environ.get('OPENROUTER_API_KEY')
+    if openrouter_key:
+        return {
+            'api_key': openrouter_key,
+            'base_url': 'https://openrouter.ai/api/v1',
+            'model': os.environ.get('OPENROUTER_MODEL', 'openai/gpt-4o-mini'),
+        }
+    openai_key = os.environ.get('OPENAI_API_KEY')
+    if openai_key:
+        return {'api_key': openai_key, 'model': os.environ.get('MODEL', 'gpt-4o-mini')}
+    return None
+
+
+LLM_CONFIG = get_llm_config()
+# Wire into LangGraph: ChatOpenAI(api_key=..., base_url=..., model=...) from LLM_CONFIG
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -30,8 +54,8 @@ config = RelayConfig(
 CHANNEL = "general"
 COMPLEX_KEYWORDS = ["billing dispute", "security incident", "legal", "fraud"]
 
-front_relay = Relay("front-desk", config)
-spec_relay = Relay("specialist", config)
+front_relay = Relay(f"front-desk-{RUN_ID}", config)
+spec_relay = Relay(f"specialist-{RUN_ID}", config)
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +75,8 @@ class ServiceState(TypedDict):
     escalated_ids: list[str]
     resolutions: list[str]
     phase: str
+    escalation_messages: list[Message]
+    resolution_messages: list[Message]
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +151,7 @@ async def triage_node(state: ServiceState) -> ServiceState:
                 f"ESCALATION {cid}\nCustomer: {name}\n"
                 f"Issue: {query}\nPriority: HIGH"
             )
-            await front_relay.send("specialist", escalation)
+            await front_relay.send(f"specialist-{RUN_ID}", escalation)
             await front_relay.post(
                 CHANNEL, f"[Front Desk] {name}'s issue ({cid}) escalated."
             )
@@ -147,13 +173,11 @@ async def triage_node(state: ServiceState) -> ServiceState:
 
 
 async def specialist_node(state: ServiceState) -> ServiceState:
-    """Process escalated issues from Relay inbox."""
+    """Process pre-captured escalation messages from state."""
     ts = datetime.now().strftime("%H:%M:%S")
-    await asyncio.sleep(0.5)
-    messages = await spec_relay.inbox()
     resolutions = []
 
-    for msg in messages:
+    for msg in state.get("escalation_messages", []):
         if "ESCALATION" not in msg.text:
             continue
         lines = msg.text.strip().splitlines()
@@ -164,7 +188,7 @@ async def specialist_node(state: ServiceState) -> ServiceState:
         issue = issue_line.replace("Issue:", "").strip()
 
         resolution = generate_resolution(cid, customer, issue)
-        await spec_relay.send("front-desk", f"RESOLUTION {cid}\n{resolution}")
+        await spec_relay.send(f"front-desk-{RUN_ID}", f"RESOLUTION {cid}\n{resolution}")
         await spec_relay.post(CHANNEL, f"[Specialist] Resolved {cid} for {customer}.")
         resolutions.append(resolution)
         print(f"[{ts}] Specialist — resolved {cid} for {customer}.")
@@ -173,12 +197,10 @@ async def specialist_node(state: ServiceState) -> ServiceState:
 
 
 async def followup_node(state: ServiceState) -> ServiceState:
-    """Front desk reads resolutions and posts follow-ups."""
+    """Process pre-captured resolution messages from state."""
     ts = datetime.now().strftime("%H:%M:%S")
-    await asyncio.sleep(0.5)
-    messages = await front_relay.inbox()
 
-    for msg in messages:
+    for msg in state.get("resolution_messages", []):
         if "RESOLUTION" not in msg.text:
             continue
         lines = msg.text.strip().splitlines()
@@ -242,10 +264,32 @@ async def main() -> None:
     print("Customer Service Escalation — LangGraph")
     print("=" * 60)
 
-    await front_relay.connect()
-    await spec_relay.connect()
-    print("Agents connected.\n")
+    # No connect() needed — Relay auto-connects on first use
+    print("Agents ready.\n")
 
+    # Set up message capture via on_message
+    escalation_msgs = []
+    resolution_msgs = []
+    escalations_done = asyncio.Event()
+    resolutions_done = asyncio.Event()
+    expected_escalations = sum(1 for c in CUSTOMERS if classify(c["query"]) == "complex")
+
+    def capture_escalations(msg):
+        if "ESCALATION" in msg.text:
+            escalation_msgs.append(msg)
+            if len(escalation_msgs) >= expected_escalations:
+                escalations_done.set()
+
+    def capture_resolutions(msg):
+        if "RESOLUTION" in msg.text:
+            resolution_msgs.append(msg)
+            if len(resolution_msgs) >= expected_escalations:
+                resolutions_done.set()
+
+    unsub_esc = spec_relay.on_message(capture_escalations)
+    unsub_res = front_relay.on_message(capture_resolutions)
+
+    # Run triage node directly to send escalations before the graph processes them
     app = build_graph()
 
     initial_state: ServiceState = {
@@ -253,14 +297,37 @@ async def main() -> None:
         "escalated_ids": [],
         "resolutions": [],
         "phase": "triage",
+        "escalation_messages": [],
+        "resolution_messages": [],
     }
 
-    final_state = await app.ainvoke(initial_state)
+    # Phase 1 — triage runs as part of the graph, but we need to intercept
+    # between phases. Run triage separately, then inject captured messages.
+    triage_result = await triage_node(initial_state)
+
+    # Phase 2 — wait for escalations to arrive
+    if expected_escalations > 0:
+        await asyncio.wait_for(escalations_done.wait(), timeout=30)
+    unsub_esc()
+    triage_result["escalation_messages"] = escalation_msgs
+
+    # Run specialist node
+    specialist_result = await specialist_node(triage_result)
+
+    # Phase 3 — wait for resolutions to arrive
+    if expected_escalations > 0:
+        await asyncio.wait_for(resolutions_done.wait(), timeout=30)
+    unsub_res()
+    specialist_result["resolution_messages"] = resolution_msgs
+
+    # Run followup node
+    final_state = await followup_node(specialist_result)
+
     print(f"\nFinal phase: {final_state['phase']}")
     print(f"Resolutions: {len(final_state['resolutions'])}")
 
-    await front_relay.close()
-    await spec_relay.close()
+    await asyncio.wait_for(front_relay.close(), timeout=5)
+    await asyncio.wait_for(spec_relay.close(), timeout=5)
     print("=" * 60)
     print("Done.")
 

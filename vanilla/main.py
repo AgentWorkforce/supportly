@@ -14,6 +14,29 @@ from datetime import datetime
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
 
+import uuid
+from dotenv import load_dotenv
+load_dotenv()
+RUN_ID = uuid.uuid4().hex[:6]
+
+
+def get_llm_config():
+    """Detect LLM provider: OpenRouter > OpenAI > None (use mock responses)."""
+    openrouter_key = os.environ.get('OPENROUTER_API_KEY')
+    if openrouter_key:
+        return {
+            'api_key': openrouter_key,
+            'base_url': 'https://openrouter.ai/api/v1',
+            'model': os.environ.get('OPENROUTER_MODEL', 'openai/gpt-4o-mini'),
+        }
+    openai_key = os.environ.get('OPENAI_API_KEY')
+    if openai_key:
+        return {'api_key': openai_key, 'model': os.environ.get('MODEL', 'gpt-4o-mini')}
+    return None
+
+
+LLM_CONFIG = get_llm_config()
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -94,7 +117,7 @@ async def front_desk(relay: Relay) -> list[str]:
                 f"Issue: {query}\n"
                 f"Priority: HIGH"
             )
-            await relay.send("specialist", escalation_msg)
+            await relay.send(f"specialist-{RUN_ID}", escalation_msg)
             await relay.post(
                 CHANNEL,
                 f"[Front Desk] {name}'s issue ({cid}) escalated to specialist.",
@@ -109,12 +132,9 @@ async def front_desk(relay: Relay) -> list[str]:
 # Specialist Agent
 # ---------------------------------------------------------------------------
 
-async def specialist_process(relay: Relay) -> None:
-    """Check inbox for escalations and resolve them."""
-    await asyncio.sleep(0.5)  # allow messages to arrive
-    messages = await relay.inbox()
-
-    for msg in messages:
+async def specialist_process(relay: Relay, escalation_messages: list[Message]) -> None:
+    """Process pre-captured escalation messages."""
+    for msg in escalation_messages:
         if "ESCALATION" not in msg.text:
             continue
 
@@ -130,7 +150,7 @@ async def specialist_process(relay: Relay) -> None:
 
         resolution = generate_resolution(cid, customer_name, issue)
 
-        await relay.send("front-desk", f"RESOLUTION {cid}\n{resolution}")
+        await relay.send(f"front-desk-{RUN_ID}", f"RESOLUTION {cid}\n{resolution}")
         await relay.post(CHANNEL, f"[Specialist] Resolved {cid} for {customer_name}.")
         print(f"[{ts}] Specialist — resolved {cid}.")
 
@@ -156,12 +176,9 @@ def generate_resolution(cid: str, customer: str, issue: str) -> str:
 # Follow-up — Front Desk reads specialist responses
 # ---------------------------------------------------------------------------
 
-async def follow_up(relay: Relay) -> None:
-    """Front desk checks inbox for specialist resolutions."""
-    await asyncio.sleep(0.5)
-    messages = await relay.inbox()
-
-    for msg in messages:
+async def follow_up(relay: Relay, resolution_messages: list[Message]) -> None:
+    """Process pre-captured resolution messages."""
+    for msg in resolution_messages:
         if "RESOLUTION" not in msg.text:
             continue
         lines = msg.text.strip().splitlines()
@@ -180,32 +197,61 @@ async def main() -> None:
     print("=" * 60)
     print("Customer Service Escalation — Vanilla Python")
     print("=" * 60)
+    print(f"LLM provider: {LLM_CONFIG['base_url'] if LLM_CONFIG and 'base_url' in LLM_CONFIG else 'OpenAI' if LLM_CONFIG else 'mock'}")
 
-    front = Relay("front-desk", config)
-    spec = Relay("specialist", config)
+    front = Relay(f"front-desk-{RUN_ID}", config)
+    spec = Relay(f"specialist-{RUN_ID}", config)
 
-    await front.connect()
-    await spec.connect()
-    print("Agents connected.\n")
+    await front.join("general")
+    await spec.join("general")
+    print("Agents ready.\n")
+
+    # Set up message capture via on_message
+    escalation_msgs = []
+    resolution_msgs = []
+    escalations_done = asyncio.Event()
+    resolutions_done = asyncio.Event()
+    expected_escalations = sum(1 for c in CUSTOMERS if classify(c["query"]) == "complex")
+
+    def capture_escalations(msg):
+        if "ESCALATION" in msg.text:
+            escalation_msgs.append(msg)
+            if len(escalation_msgs) >= expected_escalations:
+                escalations_done.set()
+
+    def capture_resolutions(msg):
+        if "RESOLUTION" in msg.text:
+            resolution_msgs.append(msg)
+            if len(resolution_msgs) >= expected_escalations:
+                resolutions_done.set()
+
+    unsub_esc = spec.on_message(capture_escalations)
+    unsub_res = front.on_message(capture_resolutions)
 
     # Phase 1 — triage
     print("--- Phase 1: Triage ---")
     escalated = await front_desk(front)
     print(f"\nEscalated cases: {escalated}\n")
 
-    # Phase 2 — specialist handles escalations
+    # Phase 2 — wait for escalations to arrive, then process
     print("--- Phase 2: Specialist Processing ---")
-    await specialist_process(spec)
+    if expected_escalations > 0:
+        await asyncio.wait_for(escalations_done.wait(), timeout=30)
+    unsub_esc()
+    await specialist_process(spec, escalation_msgs)
     print()
 
-    # Phase 3 — front desk reads resolutions
+    # Phase 3 — wait for resolutions to arrive, then process
     print("--- Phase 3: Follow-up ---")
-    await follow_up(front)
+    if expected_escalations > 0:
+        await asyncio.wait_for(resolutions_done.wait(), timeout=30)
+    unsub_res()
+    await follow_up(front, resolution_msgs)
     print()
 
     # Cleanup
-    await front.close()
-    await spec.close()
+    await asyncio.wait_for(front.close(), timeout=5)
+    await asyncio.wait_for(spec.close(), timeout=5)
     print("=" * 60)
     print("Done.")
 

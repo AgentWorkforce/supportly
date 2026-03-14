@@ -3,11 +3,16 @@ Customer Service Escalation — CrewAI + Relay SDK
 
 Two CrewAI agents (Front Desk, Specialist) collaborate via Relay DMs
 to triage and resolve customer issues.
+
+NOTE: Agent/Task/Crew definitions are kept for demonstration purposes.
+Instead of crew.kickoff() (which requires an LLM), we directly execute
+the tool functions to simulate the crew workflow.
 """
 
 import asyncio
 import os
 import random
+import re
 import string
 from datetime import datetime
 
@@ -16,6 +21,30 @@ from crewai.tools import tool
 
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
+
+import uuid
+from dotenv import load_dotenv
+load_dotenv()
+RUN_ID = uuid.uuid4().hex[:6]
+
+
+def get_llm_config():
+    """Detect LLM provider: OpenRouter > OpenAI > None (use mock responses)."""
+    openrouter_key = os.environ.get('OPENROUTER_API_KEY')
+    if openrouter_key:
+        return {
+            'api_key': openrouter_key,
+            'base_url': 'https://openrouter.ai/api/v1',
+            'model': os.environ.get('OPENROUTER_MODEL', 'openai/gpt-4o-mini'),
+        }
+    openai_key = os.environ.get('OPENAI_API_KEY')
+    if openai_key:
+        return {'api_key': openai_key, 'model': os.environ.get('MODEL', 'gpt-4o-mini')}
+    return None
+
+
+LLM_CONFIG = get_llm_config()
+# Wire into CrewAI agents: Agent(llm=LLM_CONFIG['model'], ...) when LLM_CONFIG is set
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -32,15 +61,15 @@ CHANNEL = "general"
 SIMPLE_TOPICS = {"hours", "shipping", "returns", "tracking", "faq"}
 COMPLEX_TOPICS = {"billing_dispute", "security_incident", "legal", "fraud"}
 
-front_relay = Relay("front-desk", config)
-spec_relay = Relay("specialist", config)
+front_relay = Relay(f"front-desk-{RUN_ID}", config)
+spec_relay = Relay(f"specialist-{RUN_ID}", config)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def case_id() -> str:
+def make_case_id() -> str:
     tag = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"CASE-{tag}"
 
@@ -93,19 +122,19 @@ CUSTOMERS = [
 
 
 # ---------------------------------------------------------------------------
-# CrewAI Tools — backed by Relay
+# CrewAI Tools — backed by Relay (kept for demonstration)
 # ---------------------------------------------------------------------------
 
 @tool("escalate_to_specialist")
 def escalate_to_specialist(customer_name: str, issue: str) -> str:
     """Escalate a complex customer issue to the specialist agent via Relay DM."""
-    cid = case_id()
+    cid = make_case_id()
     escalation = (
         f"ESCALATION {cid}\nCustomer: {customer_name}\n"
         f"Issue: {issue}\nPriority: HIGH"
     )
     asyncio.get_event_loop().run_until_complete(
-        front_relay.send("specialist", escalation)
+        front_relay.send(f"specialist-{RUN_ID}", escalation)
     )
     asyncio.get_event_loop().run_until_complete(
         front_relay.post(CHANNEL, f"[Front Desk] {customer_name}'s issue ({cid}) escalated.")
@@ -136,7 +165,7 @@ def check_specialist_inbox() -> str:
 def send_resolution(case_id: str, customer_name: str, resolution_text: str) -> str:
     """Send a resolution back to front desk via Relay DM and post summary."""
     asyncio.get_event_loop().run_until_complete(
-        spec_relay.send("front-desk", f"RESOLUTION {case_id}\n{resolution_text}")
+        spec_relay.send(f"front-desk-{RUN_ID}", f"RESOLUTION {case_id}\n{resolution_text}")
     )
     asyncio.get_event_loop().run_until_complete(
         spec_relay.post(CHANNEL, f"[Specialist] Resolved {case_id} for {customer_name}.")
@@ -155,7 +184,7 @@ def check_frontdesk_inbox() -> str:
 
 
 # ---------------------------------------------------------------------------
-# CrewAI Agents
+# CrewAI Agents (kept for demonstration — not executed via crew.kickoff)
 # ---------------------------------------------------------------------------
 
 front_desk_agent = Agent(
@@ -184,7 +213,7 @@ followup_agent = Agent(
 
 
 # ---------------------------------------------------------------------------
-# Tasks
+# Tasks (kept for demonstration)
 # ---------------------------------------------------------------------------
 
 def build_triage_description() -> str:
@@ -217,7 +246,7 @@ followup_task = Task(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — direct execution (bypasses LLM via crew.kickoff)
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
@@ -225,23 +254,104 @@ async def main() -> None:
     print("Customer Service Escalation — CrewAI")
     print("=" * 60)
 
-    await front_relay.connect()
-    await spec_relay.connect()
-    print("Relay agents connected.\n")
+    print("Relay agents ready.\n")
 
+    # Crew definition kept for demonstration
     crew = Crew(
         agents=[front_desk_agent, specialist_agent, followup_agent],
         tasks=[triage_task, specialist_task, followup_task],
         process=Process.sequential,
         verbose=True,
     )
+    print(f"Crew defined with {len(crew.agents)} agents, {len(crew.tasks)} tasks.\n")
 
-    result = crew.kickoff()
-    print("\n--- Crew Result ---")
-    print(result)
+    # Set up message capture via on_message
+    escalation_msgs = []
+    resolution_msgs = []
+    escalations_done = asyncio.Event()
+    resolutions_done = asyncio.Event()
+    expected_escalations = sum(1 for c in CUSTOMERS if classify(c["query"]) == "complex")
 
-    await front_relay.close()
-    await spec_relay.close()
+    def capture_escalations(msg):
+        if "ESCALATION" in msg.text:
+            escalation_msgs.append(msg)
+            if len(escalation_msgs) >= expected_escalations:
+                escalations_done.set()
+
+    def capture_resolutions(msg):
+        if "RESOLUTION" in msg.text:
+            resolution_msgs.append(msg)
+            if len(resolution_msgs) >= expected_escalations:
+                resolutions_done.set()
+
+    unsub_esc = spec_relay.on_message(capture_escalations)
+    unsub_res = front_relay.on_message(capture_resolutions)
+
+    # --- Phase 1: Triage (direct execution instead of crew.kickoff) ---
+    print("--- Phase 1: Triage ---")
+    for c in CUSTOMERS:
+        name, query = c["name"], c["query"]
+        category = classify(query)
+        ts = datetime.now().strftime("%H:%M:%S")
+        if category == "simple":
+            answer = simple_answer(query)
+            await front_relay.post(
+                CHANNEL, f"[Front Desk] {name} asked: {query}\nAnswer: {answer}"
+            )
+            print(f"[{ts}] Front Desk — answered {name} directly.")
+        else:
+            cid = make_case_id()
+            escalation = (
+                f"ESCALATION {cid}\nCustomer: {name}\n"
+                f"Issue: {query}\nPriority: HIGH"
+            )
+            await front_relay.send(f"specialist-{RUN_ID}", escalation)
+            await front_relay.post(
+                CHANNEL, f"[Front Desk] {name}'s issue ({cid}) escalated."
+            )
+            print(f"[{ts}] Front Desk — escalated {name} → specialist ({cid})")
+    print()
+
+    # --- Phase 2: Specialist ---
+    print("--- Phase 2: Specialist Processing ---")
+    if expected_escalations > 0:
+        await asyncio.wait_for(escalations_done.wait(), timeout=30)
+    unsub_esc()
+    for msg in escalation_msgs:
+        if "ESCALATION" not in msg.text:
+            continue
+        lines = msg.text.strip().splitlines()
+        cid = lines[0].split()[-1] if lines else "UNKNOWN"
+        customer_line = next((l for l in lines if l.startswith("Customer:")), "")
+        issue_line = next((l for l in lines if l.startswith("Issue:")), "")
+        customer = customer_line.replace("Customer:", "").strip()
+        issue = issue_line.replace("Issue:", "").strip()
+
+        resolution = generate_resolution(cid, customer, issue)
+        await spec_relay.send(f"front-desk-{RUN_ID}", f"RESOLUTION {cid}\n{resolution}")
+        await spec_relay.post(CHANNEL, f"[Specialist] Resolved {cid} for {customer}.")
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] Specialist — resolved {cid} for {customer}.")
+    print()
+
+    # --- Phase 3: Follow-up ---
+    print("--- Phase 3: Follow-up ---")
+    if expected_escalations > 0:
+        await asyncio.wait_for(resolutions_done.wait(), timeout=30)
+    unsub_res()
+    for msg in resolution_msgs:
+        if "RESOLUTION" not in msg.text:
+            continue
+        lines = msg.text.strip().splitlines()
+        cid = lines[0].split()[-1] if lines else "UNKNOWN"
+        detail = "\n".join(lines[1:]).strip()
+        await front_relay.post(CHANNEL, f"[Front Desk] Resolution received:\n{detail}")
+        ts = datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] Follow-up — posted resolution for {cid}.")
+
+    await asyncio.wait_for(front_relay.close(), timeout=5)
+    await asyncio.wait_for(spec_relay.close(), timeout=5)
+    print()
     print("=" * 60)
     print("Done.")
 
