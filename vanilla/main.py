@@ -202,8 +202,6 @@ async def main() -> None:
     front = Relay(f"front-desk-{RUN_ID}", config)
     spec = Relay(f"specialist-{RUN_ID}", config)
 
-    await front.join("general")
-    await spec.join("general")
     print("Agents ready.\n")
 
     # Set up message capture via on_message

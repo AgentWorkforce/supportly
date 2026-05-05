@@ -8,7 +8,7 @@ Two agents (Front Desk + Specialist) triage customer queries. Simple ones answer
 ## Prerequisites
 
 - Python 3.10+
-- Agent Relay SDK: `pip install agent-relay` (or install from `/tmp/relay-565/packages/sdk-py`)
+- Agent Relay SDK: `pip install 'agent-relay-sdk[communicate]>=6.0.9'`
 
 ## Framework Variants
 
@@ -45,17 +45,27 @@ export OPENAI_API_KEY=sk-...                 # OpenAI directly
 ### 2. Install dependencies
 
 ```bash
-cd ~/Projects/relay-poc-customer-service
-pip install agent-relay httpx asyncio
+pip install -r requirements.txt
 ```
 
-### 3. Run the vanilla app
+### 3. Run the live demo (browser UI)
+
+```bash
+python3 server.py
+# open http://localhost:8081
+```
+
+Five agents register on Relay (~10s), then submit a ticket via the UI to
+watch the live event feed: triage → channel post → specialist pickup →
+resolution → QA score, with cost comparison vs single-agent.
+
+### 4. Run the vanilla CLI variant
 
 ```bash
 python3 vanilla/main.py
 ```
 
-### 4. Run other variants
+### 5. Run other framework variants
 
 ```bash
 python3 crewai/main.py

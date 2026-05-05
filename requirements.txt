@@ -1,7 +1,6 @@
 # Core
-agent-relay
+agent-relay-sdk[communicate]>=6.0.9
 httpx>=0.24.0
-asyncio-compat>=0.1.0
 
 # Framework variants (optional)
 crewai>=0.80.0
@@ -9,9 +8,9 @@ openai-agents>=0.1.0
 langgraph>=0.2.0
 google-adk>=0.5.0
 
-# Integrations server
+# Integrations server + live demo UI
 fastapi>=0.100.0
-uvicorn>=0.23.0
+uvicorn[standard]>=0.23.0
 
 # OpenRouter support (optional)
 openai>=1.0.0
