@@ -24,20 +24,23 @@ Each variant implements the same app with a different AI/agent framework:
 
 ## Quick Start
 
-### 1. Set environment variables
+### 1. Optional environment variables
+
+Supportly auto-provisions a fresh Relaycast workspace on first run and
+caches the credentials in `.relay-state.json`, so no env vars are
+required to get started. Set the variables below to override.
 
 ```bash
-# Required — Relay SDK connection
+# Optional — point at an existing Relay workspace
 export RELAY_API_KEY=rk_live_YOUR_KEY
 export RELAY_WORKSPACE=your-workspace
 export RELAY_BASE_URL=https://api.relaycast.dev
 
 # Optional — LLM provider (choose one)
-export OPENROUTER_API_KEY=sk-or-...          # OpenRouter (100+ models)
+export OPENROUTER_API_KEY=sk-or-...                  # OpenRouter (100+ models)
 export OPENROUTER_MODEL=anthropic/claude-3.5-sonnet  # default: openai/gpt-4o-mini
-
 # OR
-export OPENAI_API_KEY=sk-...                 # OpenAI directly
+export OPENAI_API_KEY=sk-...                         # OpenAI directly
 
 # No LLM key? App runs with simulated/mock responses.
 ```

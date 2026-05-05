@@ -35,15 +35,12 @@ from fastapi.responses import FileResponse
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
 from integrations.context_loader import get_context
+from bootstrap import get_relay_config
 
 app = FastAPI()
 
 RUN_ID = uuid.uuid4().hex[:4]
-CFG = RelayConfig(
-    workspace=os.environ.get("RELAY_WORKSPACE", "demo"),
-    api_key=os.environ.get("RELAY_API_KEY", "demo-key"),
-    base_url=os.environ.get("RELAY_BASE_URL", "https://api.relaycast.dev"),
-)
+CFG = get_relay_config()
 CHANNEL = f"escalations-{RUN_ID}"
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")

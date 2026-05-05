@@ -14,9 +14,14 @@ from datetime import datetime
 from agent_relay.communicate import Relay
 from agent_relay.communicate.types import RelayConfig, Message
 
+import sys
 import uuid
+from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from bootstrap import get_relay_config  # noqa: E402
 RUN_ID = uuid.uuid4().hex[:6]
 
 
@@ -41,11 +46,7 @@ LLM_CONFIG = get_llm_config()
 # Configuration
 # ---------------------------------------------------------------------------
 
-config = RelayConfig(
-    workspace=os.environ.get("RELAY_WORKSPACE", "demo"),
-    api_key=os.environ.get("RELAY_API_KEY", "demo-key"),
-    base_url=os.environ.get("RELAY_BASE_URL", "https://api.relaycast.dev"),
-)
+config = get_relay_config()
 
 CHANNEL = "general"
 
